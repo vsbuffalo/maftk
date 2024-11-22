@@ -1,3 +1,5 @@
+[![CI](https://github.com/vsbuffalo/biomaf/actions/workflows/ci.yml/badge.svg)](https://github.com/vsbuffalo/biomaf/actions/workflows/ci.yml)
+
 # biomaf — experimental MAF parser in Rust 🦀
 
 A very small Multiple Alignment Format (MAF) parser in Rust. Co-written with
