@@ -1,0 +1,19 @@
+[package]
+name = "biomaf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.21", features = ["derive"] }
+flate2 = "1.0.35"
+indicatif = "0.17.9"
+thiserror = "2.0.3"
+
+[lib]
+name = "biomaf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "biomaf"
+path = "src/main.rs"
+
