@@ -107,7 +107,6 @@ pub fn get_reader(filepath: &Path) -> io::Result<Box<dyn BufRead>> {
     }
 }
 
-///
 pub type BoxedReader = Box<dyn BufRead>;
 
 pub struct MafReader {
@@ -338,13 +337,13 @@ mod tests {
 
         // Check that gaps are preserved in the sequences
         let hg38 = &block.sequences[0].text;
-        let panTro4 = &block.sequences[1].text;
+        let pantro4 = &block.sequences[1].text;
 
         assert!(hg38.contains("----")); // Check for gap presence
-        assert!(panTro4.contains("----"));
+        assert!(pantro4.contains("----"));
 
         // Verify specific gap in panTro4 sequence (the single base deletion)
-        assert!(panTro4.contains("TTTTCAA-GC"));
+        assert!(pantro4.contains("TTTTCAA-GC"));
     }
 
     #[test]
@@ -403,12 +402,12 @@ mod tests {
         }
 
         // Check specific gaps that we know should be present
-        let panTro4 = block
+        let pantro4 = block
             .sequences
             .iter()
             .find(|s| s.src == "panTro4.chrUn_GL393523")
             .unwrap();
-        assert!(panTro4.text.contains("TTTTCAA-GC"));
+        assert!(pantro4.text.contains("TTTTCAA-GC"));
 
         // Test info line for a sequence with non-zero counts
         let equcab_info = block

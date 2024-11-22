@@ -154,9 +154,6 @@ fn split_maf(
                 .map(|(_, name)| name != &filename)
                 .unwrap_or(true)
             {
-                // Close existing file if any
-                current_file = None;
-
                 // Create new file
                 let mut file = File::create(&filepath)?;
                 write_maf_header(&mut file, &header)?;
