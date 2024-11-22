@@ -10,3 +10,10 @@ Subcommands:
     - `biomaf split`: Split a chromosome's MAF file into a series of MAF files
       per region alignment.
 
+## Installation
+
+For now, this isn't on [crates.io](http://crates.io). So, use:
+
+```
+$ cargo install --git https://github.com/vsbuffalo/biomaf
+```
