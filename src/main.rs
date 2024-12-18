@@ -1,4 +1,6 @@
-use biomaf::MafReader;
+use biomaf::binary::{convert_to_binary, query_command};
+use biomaf::index::FastIndex;
+use biomaf::io::MafReader;
 use clap::Parser;
 use std::fs::create_dir_all;
 use std::fs::File;
@@ -9,6 +11,10 @@ use std::path::{Path, PathBuf};
 #[command(name = "maftools")]
 #[command(about = "Tools for working with Multiple Alignment Format (MAF) files")]
 struct Cli {
+    /// The verbosity level: ("info", "debug", "warn", or "error")
+    #[arg(short, long, default_value = "info")]
+    verbosity: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -18,20 +24,62 @@ enum Commands {
     /// Split a MAF file into chunks by region
     Split {
         /// Input MAF file
-        #[arg(value_name = "FILE")]
+        #[arg(value_name = "input.maf")]
         input: PathBuf,
 
         /// Output directory for split MAF files
-        #[arg(short, long, value_name = "DIR")]
+        #[arg(short, long, default_value = "split_mafs")]
         output_dir: PathBuf,
 
         /// Minimum length of alignment block to include (default: 0)
         #[arg(short, long, default_value = "0")]
         min_length: u64,
     },
+    /// Convert MAF to binary 3-bit format with index
+    Binary {
+        /// Input MAF file
+        #[arg(value_name = "input.maf")]
+        input: PathBuf,
+
+        /// Output directory
+        #[arg(short, long, default_value = "maf.mmdb")]
+        output_dir: PathBuf,
+
+        /// Minimum length of alignment block to include
+        #[arg(short, long, default_value = "0")]
+        min_length: u64,
+    },
+    /// Get alignments at a specific position or range
+    Query {
+        /// Chromosome name (e.g., chr22)
+        #[arg(value_name = "chromosome")]
+        chromosome: String,
+
+        /// Start position (1-based)
+        #[arg(value_name = "start")]
+        start: u32,
+
+        /// End position (optional, defaults to start+1)
+        #[arg(value_name = "end")]
+        end: Option<u32>,
+
+        /// Directory containing binary MAF files
+        #[arg(short, long, default_value = "maf.mmdb")]
+        data_dir: PathBuf,
+
+        /// Print timing information
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Debug an index file's structure
+    DebugIndex {
+        /// Path to index file
+        #[arg(value_name = "index_file")]
+        path: PathBuf,
+    },
 }
 
-fn write_maf_header(file: &mut File, header: &biomaf::MafHeader) -> std::io::Result<()> {
+fn write_maf_header(file: &mut File, header: &biomaf::io::MafHeader) -> std::io::Result<()> {
     write!(file, "##maf version={}", header.version)?;
     if let Some(scoring) = &header.scoring {
         write!(file, " scoring={}", scoring)?;
@@ -43,7 +91,7 @@ fn write_maf_header(file: &mut File, header: &biomaf::MafHeader) -> std::io::Res
     writeln!(file) // Extra newline after header
 }
 
-fn write_block(file: &mut File, block: &biomaf::AlignmentBlock) -> std::io::Result<()> {
+fn write_block(file: &mut File, block: &biomaf::io::AlignmentBlock) -> std::io::Result<()> {
     // Write alignment line
     write!(file, "a")?;
     if let Some(score) = block.score {
@@ -62,7 +110,7 @@ fn write_block(file: &mut File, block: &biomaf::AlignmentBlock) -> std::io::Resu
             seq.src,
             seq.start,
             seq.size,
-            if seq.strand == biomaf::Strand::Forward {
+            if seq.strand == biomaf::io::Strand::Forward {
                 "+"
             } else {
                 "-"
@@ -79,21 +127,21 @@ fn write_block(file: &mut File, block: &biomaf::AlignmentBlock) -> std::io::Resu
             "i {} {} {} {} {}",
             info.src,
             match info.left_status {
-                biomaf::StatusChar::Contiguous => "C",
-                biomaf::StatusChar::Intervening => "I",
-                biomaf::StatusChar::New => "N",
-                biomaf::StatusChar::NewBridged => "n",
-                biomaf::StatusChar::Missing => "M",
-                biomaf::StatusChar::Tandem => "T",
+                biomaf::io::StatusChar::Contiguous => "C",
+                biomaf::io::StatusChar::Intervening => "I",
+                biomaf::io::StatusChar::New => "N",
+                biomaf::io::StatusChar::NewBridged => "n",
+                biomaf::io::StatusChar::Missing => "M",
+                biomaf::io::StatusChar::Tandem => "T",
             },
             info.left_count,
             match info.right_status {
-                biomaf::StatusChar::Contiguous => "C",
-                biomaf::StatusChar::Intervening => "I",
-                biomaf::StatusChar::New => "N",
-                biomaf::StatusChar::NewBridged => "n",
-                biomaf::StatusChar::Missing => "M",
-                biomaf::StatusChar::Tandem => "T",
+                biomaf::io::StatusChar::Contiguous => "C",
+                biomaf::io::StatusChar::Intervening => "I",
+                biomaf::io::StatusChar::New => "N",
+                biomaf::io::StatusChar::NewBridged => "n",
+                biomaf::io::StatusChar::Missing => "M",
+                biomaf::io::StatusChar::Tandem => "T",
             },
             info.right_count,
         )?;
@@ -102,7 +150,7 @@ fn write_block(file: &mut File, block: &biomaf::AlignmentBlock) -> std::io::Resu
     writeln!(file) // Extra newline between blocks
 }
 
-fn get_block_range(block: &biomaf::AlignmentBlock) -> Option<(String, u64, u64)> {
+fn get_block_range(block: &biomaf::io::AlignmentBlock) -> Option<(String, u64, u64)> {
     // Get the first sequence in the block
     let first_seq = block.sequences.first()?;
 
@@ -180,7 +228,30 @@ fn split_maf(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    // Set up tracing level based on verbosity argument
+    let level = match cli.verbosity.to_lowercase().as_str() {
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "info" => tracing::Level::INFO,
+        "warn" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        _ => {
+            eprintln!("Invalid verbosity level: {}", cli.verbosity);
+            std::process::exit(1);
+        }
+    };
+
+    // Initialize logger with default level INFO
+    tracing_subscriber::fmt().with_max_level(level).init();
+
     match cli.command {
+        Commands::Binary {
+            input,
+            output_dir,
+            min_length,
+        } => {
+            convert_to_binary(&input, &output_dir, min_length)?;
+        }
         Commands::Split {
             input,
             output_dir,
@@ -197,6 +268,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Blocks written: {}",
                 stats.total_blocks - stats.filtered_blocks
             );
+        }
+        Commands::Query {
+            chromosome,
+            start,
+            end,
+            data_dir,
+            verbose,
+        } => {
+            let end = end.unwrap_or(start + 1);
+            if end <= start {
+                eprintln!("End position must be greater than start position");
+                std::process::exit(1);
+            }
+            query_command(&chromosome, start, end, &data_dir, verbose)?;
+        }
+        Commands::DebugIndex { path } => {
+            let index = FastIndex::open(&path)?;
+            index.debug_print();
         }
     }
 
