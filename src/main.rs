@@ -1,4 +1,4 @@
-use biomaf::binary::{convert_to_binary, query_command};
+use biomaf::binary::{convert_to_binary, query_command, stats_command};
 use biomaf::index::FastIndex;
 use biomaf::io::MafReader;
 use clap::Parser;
@@ -71,6 +71,22 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Calculate an alignment statistics table for all alignments
+    /// in the supplied BED file.
+    Stats {
+        /// Input BED3 file
+        #[arg(value_name = "regions.bed")]
+        regions: PathBuf,
+
+        /// Directory containing binary MAF files
+        #[arg(short, long, default_value = "maf.mmdb")]
+        data_dir: PathBuf,
+
+        /// Print timing information
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
     /// Debug an index file's structure
     DebugIndex {
         /// Path to index file
@@ -283,6 +299,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             query_command(&chromosome, start, end, &data_dir, verbose)?;
         }
+        Commands::Stats {
+            regions,
+            data_dir,
+            verbose,
+        } => stats_command(&regions, &data_dir, verbose)?,
         Commands::DebugIndex { path } => {
             let index = FastIndex::open(&path)?;
             index.debug_print();

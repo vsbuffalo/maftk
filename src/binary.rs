@@ -1,8 +1,10 @@
 // binary.rs
-use crate::index::FastIndex;
 use crate::io::MafReader;
+use crate::{index::FastIndex, io::InputFile};
+use csv::ReaderBuilder;
 use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry;
 use std::{
     collections::HashMap,
     fs::{create_dir_all, File},
@@ -56,7 +58,7 @@ fn print_alignment_block(
     };
     let end_pos = ((query_end - block_start) as usize).min(block_size);
 
-    debug!(
+    trace!(
         ?header,
         block_start,
         block_size,
@@ -367,5 +369,96 @@ pub fn query_command(
         );
     }
 
+    Ok(())
+}
+
+pub fn stats_command(
+    regions: &Path,
+    data_dir: &Path,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input_file = InputFile::new(&regions);
+    let buf_reader = input_file.reader()?;
+
+    let mut reader = ReaderBuilder::new()
+        .comment(Some(b'#'))
+        .delimiter(b'\t')
+        .has_headers(false)
+        .from_reader(buf_reader);
+
+    let mut index_map: HashMap<String, IndexedMafReader> = HashMap::new();
+
+    for result in reader.records() {
+        let record = result?;
+        let chrom = record[0].to_string();
+        let total_time = Instant::now();
+        let index = match index_map.entry(chrom.clone()) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => v.insert(IndexedMafReader::open(&chrom, data_dir)?),
+        };
+
+        let start: u32 = record[1].parse()?;
+        let end: u32 = record[1].parse()?;
+
+        // Using indexed query to find overlapping blocks.
+        let find_start = Instant::now();
+        let blocks = index.find_blocks(start, end);
+        if verbose {
+            trace!(elapsed = ?find_start.elapsed(), "Finding blocks");
+        }
+
+        if blocks.is_empty() {}
+    }
+
+    // let reader = IndexedMafReader::open(chromosome, data_dir)?;
+    // if verbose {
+    //     debug!(elapsed = ?total_time.elapsed(), "Reader initialization");
+    // }
+    //
+    // // Using indexed query to find overlapping blocks.
+    // let find_start = Instant::now();
+    // let blocks = reader.find_blocks(start, end);
+    // if verbose {
+    //     debug!(elapsed = ?find_start.elapsed(), "Finding blocks");
+    // }
+    //
+    // if blocks.is_empty() {
+    //     info!(chromosome, start, end, "No alignment blocks found");
+    //     return Ok(());
+    // }
+    //
+    // debug!(block_count = blocks.len(), "Found overlapping blocks");
+    //
+    // let process_start = Instant::now();
+    // for (offset, header, block_start) in blocks {
+    //     let block_start_time = Instant::now();
+    //     print_alignment_block(
+    //         &reader.mmap,
+    //         offset,
+    //         &header,
+    //         block_start,
+    //         start,
+    //         end,
+    //         reader.species_map(),
+    //     )?;
+    //     if verbose {
+    //         debug!(
+    //             offset,
+    //             elapsed = ?block_start_time.elapsed(),
+    //             "Processed block"
+    //         );
+    //     }
+    // }
+    // if verbose {
+    //     debug!(
+    //         elapsed = ?process_start.elapsed(),
+    //         "Total block processing"
+    //     );
+    //     info!(
+    //         elapsed = ?total_time.elapsed(),
+    //         "Total query time"
+    //     );
+    // }
+    //
     Ok(())
 }
