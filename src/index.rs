@@ -1,83 +1,76 @@
-// src/index.rs
-/// The index uses a hierarchical binning scheme, like those used in BAM/tabix indexes,
-/// to efficiently store and query genomic intervals. The scheme divides the genome into
-/// bins of different sizes, with larger bins at higher levels containing smaller bins.
 ///
-/// Position on genome:        0    1kb   2kb   3kb   4kb   5kb   6kb   7kb   8kb
-/// Level 3 (1kb bins):     |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |  ...
-/// Level 2 (8kb bins):     |--------------- 0 ----------------|  ...
-/// Level 1 (64kb bins):    |------------------------- 0 -------------------------| ...
-/// Level 0 (1Mb bins):     |-------------------------------- 0 --------------------------------|
+/// ## Developer Notes
 ///
-/// # Binning Scheme
+/// ### Bit Shifting
 ///
-/// The index uses 4 levels of bins, from largest to smallest:
-/// ```text
-/// Level 0: 1Mb   bins (2^20 = 1,048,576 bp)
-/// Level 1: 64kb  bins (2^16 = 65,536 bp)
-/// Level 2: 8kb   bins (2^13 = 8,192 bp)
-/// Level 3: 1kb   bins (2^10 = 1,024 bp)
-/// ```
-///
-/// # Bin Numbering
-///
-/// Bins are numbered sequentially with a unique ID that encodes both the level and position.
-/// The first bins at each level start at:
-/// ```text
-/// Level 0 (1Mb):   0
-/// Level 1 (64kb):  1
-/// Level 2 (8kb):   9
-/// Level 3 (1kb):   73
-/// ```
-///
-/// The offset for each level is calculated as: `level_offset += 1 << (LEVELS.len() * 3 - level * 3)`
-///
-/// # Examples
+/// Here are some notes on bit-shifting, since this is a bit subtle.
+/// A key trick used by BAM indexing, etc are bin sizes that are powers
+/// of 2. A position can then be placed in bins that are powers of 2
+/// by doing integer division, e.g. position 1020 would be in first
+/// bin [0, 1024), which has index 0. The right bit shifts like
+/// position >> 10 is equivalent to position / 2^10 but much faster.
 ///
 /// ```
-/// // Example 1: Small interval fits in a single 1kb bin
-/// let start = 1000;
-/// let end = 1500;
-/// let bin = region_to_bin(start, end);
-/// assert_eq!(bin, 74);  // Level 3, second 1kb bin
-///
-/// // Example 2: Larger interval spans multiple bins
-/// let start = 1000;
-/// let end = 3000;
-/// let bins = region_to_bins(start, end);
-/// // Returns overlapping bins at all levels:
-/// // - Level 0 (1Mb):  bin 0
-/// // - Level 1 (64kb): bin 1
-/// // - Level 2 (8kb):  bins 9, 10
-/// // - Level 3 (1kb):  bins 74, 75, 76
+/// let position = 1020_u32;
+/// let level = 10;
+/// assert_eq!(position >> level, position / 2_u32.pow(10));
 /// ```
 ///
-/// # Query Algorithm
+/// ### Hierarchical Binning
 ///
-/// When querying an interval:
-/// 1. Calculate all potentially overlapping bins using `region_to_bins()`
-/// 2. Search each bin for overlapping intervals
-/// 3. Use linear index to optimize searching within bins
+/// Hierarchical binning (initially used in the UCSC browser,
+/// see http://genomewiki.ucsc.edu/index.php/Bin_indexing_system)
+/// divides the genome into multiple bins of *varying* power-of-two
+/// widths or *levels*. At each level, bins are non-overlapping.
+/// Also, lower level (smaller width) bins are perfectly contained
+/// by the higher level (larger width) bins (think about this
+/// through the right bit shift operations — the smaller bits are just
+/// cut off).
 ///
-/// For example, querying interval [1000-2000]:
-/// ```text
-/// 1. Calculate bins:
-///    - Could be in 1Mb bin:   start>>20 == end>>20  (bin 0)
-///    - Could be in 64kb bins: start>>16 == end>>16  (bin 1)
-///    - Could be in 8kb bins:  start>>13 == end>>13  (bin 9)
-///    - Must check 1kb bins:   bins 74, 75
-/// 2. Check each bin for overlapping intervals
-/// ```
+/// Here is a figure of the hierarchical binning:
 ///
-/// # Performance Considerations
+/// Level 0 (64Mb):   [       Bin 0       ]   (offset: 0)
+///                   |                   |
+/// Level 1 (1Mb):    [  1  ][  2  ][  3  ]   (offset: 1)
+///                   |      \______  
+///                   |             \
+/// Level 2 (64kb):   [9][10][11][12]         (offset: 9)
+///                   |  \___________
+///                   |              \
+/// Level 3 (8kb):    [73][74][75][76]        (offset: 73)
+///                   |   \______________
+///                   |                  \
+/// Level 4 (1kb):    [585][586][587][588]    (offset: 585)
 ///
-/// The bin sizes were chosen based on empirical analysis of multiz 100-way alignments:
-/// - Most blocks (~99.9%) are under 1kb
-/// - Mean block size is ~26bp
-/// - Very few blocks (< 0.01%) are over 50kb
+/// Coordinate Space:
+/// 0kb          32kb         64kb         96kb
+/// |------------|------------|------------|
 ///
-/// This distribution led to choosing smaller bins than traditional BAM indexing
-/// to optimize for the common case of small alignment blocks.
+/// A range is put into the *smallest bin it fits entirely into*.
+/// This ensures that each range is uniquely placed in a bin.
+/// When we want to do an overlap query operation (i.e. finding
+/// all ranges that overlap a query range), we take the query
+/// range and find all bins *at all levels* that could plausibly
+/// contain it. The overlapping bin indices are returned, and then
+/// the subset of ranges in each of these bins can be iterated through,
+/// checking for overlaps with the query range. This drastically reduces
+/// the search time for overlaps compared to checking every range.
+///
+/// While a range gets stored in a single bin via region_to_bin(),
+/// querying for overlaps via region_to_bins() returns bins at all levels
+/// since overlapping features could be stored in any of them. Think of
+/// region_to_bin() as what's used to uniquely bin a single feature
+/// region, and region_to_bins() as finding all possible bins that could
+/// contain a feature.
+///
+/// ### Offsets
+///
+/// The offsets are the first bin index for each level. It is
+/// essential that the offsets are large enough that the indices
+/// in the higher level bins do not clash with the bin indices
+/// of bin levels below. The binning levels are set with
+/// `LEVELS`, which then determines the offsets *at compile time*.
+///
 use memmap2::{Mmap, MmapOptions};
 use std::collections::HashMap;
 use std::fs::File;
@@ -88,37 +81,80 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::binary::BlockLocation;
 
-#[repr(C, packed)]
-struct IndexHeader {
-    magic: u32,               // "MAFI" in ASCII
-    n_bins: u32,              // Number of bins
-    n_intervals: u32,         // Total number of intervals
-    linear_index_offset: u64, // Where linear index starts
-    species_map_offset: u64,  // Where species map starts
-}
-
-#[repr(C, packed)]
-struct BinTableEntry {
-    bin_id: u32,
-    n_blocks: u32,
-    blocks_offset: u64,
-}
-
-mod binning {
+pub mod binning {
     use tracing::trace;
     // LEVELS defines the bin sizes as powers of 2
     // e.g. 2^10 = 1024 (1kb bins), 2^13 = 8192 (8kb bins), etc.
-    pub const LEVELS: [u32; 5] = [
-        10, // 2^10 = 1kb bins
-        13, // 2^13 = 8kb bins
+    pub const LEVELS: [u32; 6] = [
+        8,  // 2^8 =  256b bins
+        10, // 2^10 = 1kb  bins
+        13, // 2^13 = 8kb  bins
         16, // 2^16 = 64kb bins
-        20, // 2^20 = 1Mb bins
+        20, // 2^20 = 1Mb  bins
         26, // 2^26 = 64Mb bins
     ];
+
+    // Get the maximum level value at compile time, so
+    // LEVELS can be changed and nothing downstream is
+    // hardcoded.
+    const fn get_max_level() -> u32 {
+        let mut max = 0;
+        let mut i = 0;
+        while i < LEVELS.len() {
+            if LEVELS[i] > max {
+                max = LEVELS[i];
+            }
+            i += 1;
+        }
+        max
+    }
+
+    // Get the level offset for this particular LEVELS,
+    // again to make sure that LEVELS can be changed
+    // and nothing has to be hardcoded.
+    const fn calc_level_offset(idx: usize) -> u32 {
+        let mut offset = 0;
+        let mut i = 0;
+        let max_level = get_max_level();
+        while i < idx {
+            // Use max_level instead of hardcoded 26
+            offset += 1u32 << (max_level - LEVELS[LEVELS.len() - 1 - i]);
+            i += 1;
+        }
+        offset
+    }
+
+    // Helper to create array of specified length at compile time
+    const fn make_offsets<const N: usize>() -> [u32; N] {
+        let mut offsets = [0; N];
+        let mut i = 0;
+        while i < N {
+            offsets[i] = calc_level_offset(i);
+            i += 1;
+        }
+        offsets
+    }
+
+    // OFFSETS length automatically matches LEVELS
+    pub const OFFSETS: [u32; LEVELS.len()] = make_offsets();
+
+    const _: () = assert!(OFFSETS[0] == 0); // Will fail at compile time if wrong
 
     // Use 8kb chunks (2^13) for linear index - matches Level 1 bins
     pub const LINEAR_SHIFT: u32 = LEVELS[1];
 
+    /// Maps a genomic interval to the smallest possible bin that fully contains it.
+    /// Checks each level from largest (64Mb) to smallest (1kb) bins until finding
+    /// a level where start and end fall in the same bin.
+    ///
+    /// Returns the unique bin ID that can be used to store/retrieve overlapping
+    /// intervals. If no single bin contains the interval, returns bin 0 (root).
+    ///
+    /// Algorithm:
+    /// 1. For each level (largest to smallest bins):
+    /// 2. Check if start>>shift == end>>shift (same bin at this level)
+    /// 3. If yes, return bin = level_offset + (start>>shift)
+    /// 4. If no match found, return 0 (root bin)
     pub fn region_to_bin(start: u32, end: u32) -> u32 {
         let mut offset = 0;
         let mut level = 0u32; // Explicitly u32 level counter
@@ -133,7 +169,7 @@ mod binning {
             }
 
             // Calculate offset for next level using level counter
-            offset += 1 << (LEVELS.len() as u32 * 3 - (level * 3));
+            offset = OFFSETS[level as usize];
             level += 1;
         }
 
@@ -141,6 +177,21 @@ mod binning {
         0
     }
 
+    /// Returns all bins that could contain any portion of the given interval.
+    /// This includes bins at all levels that overlap any part of [start,end).
+    ///
+    /// Different from region_to_bin() which finds a single containing bin,
+    /// this returns all bins needed for a complete overlap query.
+    ///
+    /// Algorithm:
+    /// 1. For each level:
+    /// 2. Calculate first and last overlapping bins:
+    ///    b_start = offset + (start>>shift)
+    ///    b_end = offset + (end>>shift)
+    /// 3. Add all bins in range [b_start,b_end] at this level
+    /// 4. Move to next level and adjust offset
+    ///
+    /// Returns bins sorted by level (largest to smallest) and position.
     pub fn region_to_bins(start: u32, end: u32) -> Vec<u32> {
         let mut list = Vec::with_capacity(LEVELS.len());
         let mut offset = 0;
@@ -158,11 +209,27 @@ mod binning {
             }
 
             // Calculate offset for next level
-            offset += 1 << (LEVELS.len() as u32 * 3 - (level * 3));
+            offset = OFFSETS[level as usize];
             level += 1;
         }
         list
     }
+}
+
+#[repr(C, packed)]
+struct IndexHeader {
+    magic: u32,               // "MAFI" in ASCII
+    n_bins: u32,              // Number of bins
+    n_intervals: u32,         // Total number of intervals
+    linear_index_offset: u64, // Where linear index starts
+    species_map_offset: u64,  // Where species map starts
+}
+
+#[repr(C, packed)]
+struct BinTableEntry {
+    bin_id: u32,
+    n_blocks: u32,
+    blocks_offset: u64,
 }
 
 pub struct FastIndex {
@@ -294,12 +361,6 @@ impl FastIndex {
     /// For a region [start, end), returns blocks that overlap this region, sorted
     /// by their offset in the binary MAF file. Uses a binning scheme to efficiently
     /// find candidate blocks and a linear index to optimize seeking within the file.
-    ///
-    /// # Example
-    /// ```rust
-    /// let blocks = index.find_blocks(1000, 2000);
-    /// // Returns blocks spanning [1000,2000), sorted by file offset
-    /// ```
     ///
     /// The linear index at the `LINEAR_SHIFT` resolution (8kb) is used to
     /// skip blocks that occur before the query region, reducing seek time.
@@ -434,4 +495,119 @@ impl FastIndex {
 
 unsafe fn as_bytes<T>(x: &T) -> &[u8] {
     std::slice::from_raw_parts((x as *const T) as *const u8, std::mem::size_of::<T>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_binning_functions() {}
+
+    //#[test]
+    //fn test_binning_functions() {
+    //    // Test region_to_bin with small interval that fits in a single bin
+    //    let bin = binning::region_to_bin(1000, 1500);
+    //    assert_eq!(bin, 74, "Small interval should map to bin 74");
+
+    //    // Test region_to_bin with larger interval
+    //    let bin = binning::region_to_bin(1000, 2000);
+    //    assert_eq!(bin, 9, "Larger interval should map to an 8kb bin");
+
+    //    // Test region_to_bins
+    //    let bins = binning::region_to_bins(1000, 3000);
+    //    // Check for expected bins at each level
+    //    assert!(bins.contains(&0), "Should contain 1Mb bin");
+    //    assert!(bins.contains(&1), "Should contain 64kb bin");
+    //    assert!(bins.contains(&9), "Should contain first 8kb bin");
+    //    assert!(bins.contains(&74), "Should contain second 1kb bin");
+    //}
+
+    //#[test]
+    //fn test_fastindex_basic() -> Result<()> {
+    //    let dir = tempdir()?;
+    //    let index_path = dir.path().join("test.index");
+
+    //    // Create some test blocks
+    //    let blocks = vec![
+    //        BlockLocation {
+    //            start: 1000,
+    //            end: 1500,
+    //            offset: 0,
+    //            size: 500,
+    //        },
+    //        BlockLocation {
+    //            start: 2000,
+    //            end: 3000,
+    //            offset: 1000,
+    //            size: 1000,
+    //        },
+    //    ];
+
+    //    // Create a simple species map
+    //    let mut species_map = HashMap::new();
+    //    species_map.insert(0, "species1".to_string());
+    //    species_map.insert(1, "species2".to_string());
+
+    //    // Write index
+    //    FastIndex::write(blocks, species_map.clone(), &index_path)?;
+
+    //    // Read it back
+    //    let index = FastIndex::open(&index_path)?;
+
+    //    // Test querying blocks
+    //    let found_blocks = index.find_blocks(1200, 2500);
+    //    assert_eq!(found_blocks.len(), 2, "Should find both blocks");
+
+    //    // Test species map was preserved
+    //    assert_eq!(index.species_map(), &species_map);
+
+    //    Ok(())
+    //}
+
+    //#[test]
+    //fn test_block_retrieval() -> Result<()> {
+    //    let dir = tempdir()?;
+    //    let index_path = dir.path().join("test.index");
+
+    //    // Create overlapping blocks
+    //    let blocks = vec![
+    //        BlockLocation {
+    //            start: 1000,
+    //            end: 2000,
+    //            offset: 0,
+    //            size: 1000,
+    //        },
+    //        BlockLocation {
+    //            start: 1500,
+    //            end: 2500,
+    //            offset: 1000,
+    //            size: 1000,
+    //        },
+    //        BlockLocation {
+    //            start: 3000,
+    //            end: 4000,
+    //            offset: 2000,
+    //            size: 1000,
+    //        },
+    //    ];
+
+    //    let species_map = HashMap::new();
+    //    FastIndex::write(blocks, species_map, &index_path)?;
+    //    let index = FastIndex::open(&index_path)?;
+
+    //    // Test various queries
+    //    let found = index.find_blocks(1200, 1800);
+    //    assert_eq!(found.len(), 2, "Should find two overlapping blocks");
+
+    //    let found = index.find_blocks(2600, 2900);
+    //    assert_eq!(found.len(), 0, "Should find no blocks in gap");
+
+    //    let found = index.find_blocks(3500, 3800);
+    //    assert_eq!(found.len(), 1, "Should find one block");
+
+    //    Ok(())
+    //}
 }
