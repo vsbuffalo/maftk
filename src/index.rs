@@ -170,7 +170,7 @@ pub struct FastIndex {
     header: &'static IndexHeader,
     bin_table: &'static [BinTableEntry],
     linear_index: &'static [u64],
-    species_map: HashMap<u16, String>,
+    pub species_map: HashMap<u16, String>,
 }
 
 impl FastIndex {
@@ -435,5 +435,3 @@ impl FastIndex {
 unsafe fn as_bytes<T>(x: &T) -> &[u8] {
     std::slice::from_raw_parts((x as *const T) as *const u8, std::mem::size_of::<T>())
 }
-
-

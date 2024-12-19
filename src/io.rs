@@ -1,10 +1,14 @@
-/// io/mod.rs
+/// io.rs
 use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use std::io::{BufWriter, Error, Write};
 
 #[derive(Debug, Error)]
 pub enum MafError {
@@ -291,6 +295,67 @@ impl MafReader {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum IoError {
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+}
+
+pub struct InputFile {
+    pub filepath: PathBuf,
+}
+
+impl InputFile {
+    pub fn new(filepath: &Path) -> Self {
+        Self {
+            filepath: filepath.into(),
+        }
+    }
+
+    pub fn reader(&self) -> Result<BufReader<Box<dyn Read>>, IoError> {
+        let file = File::open(self.filepath.clone())?;
+        let reader: Box<dyn Read> = if self.filepath.ends_with(".gz") {
+            Box::new(GzDecoder::new(file))
+        } else {
+            Box::new(file)
+        };
+        Ok(BufReader::new(reader))
+    }
+
+    pub fn has_header(&self, expect: &str) -> Result<bool, IoError> {
+        let mut buf_reader = self.reader()?;
+        let mut first_line = String::new();
+        buf_reader.read_line(&mut first_line)?;
+        let has_header = first_line.starts_with(expect);
+        Ok(has_header)
+    }
+}
+
+pub struct OutputFile {
+    pub filepath: PathBuf,
+}
+
+impl OutputFile {
+    pub fn new(filepath: &Path) -> Self {
+        Self {
+            filepath: filepath.into(),
+        }
+    }
+    pub fn writer(&self) -> Result<Box<dyn Write>, Error> {
+        let outfile = &self.filepath;
+        let is_gzip = outfile.ends_with(".gz");
+        let bed_writer: Box<dyn Write> = if is_gzip {
+            Box::new(BufWriter::new(GzEncoder::new(
+                File::create(outfile)?,
+                Compression::default(),
+            )))
+        } else {
+            Box::new(BufWriter::new(File::create(outfile)?))
+        };
+        Ok(bed_writer)
     }
 }
 

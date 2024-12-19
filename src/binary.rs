@@ -8,9 +8,8 @@ use std::{
     fs::{create_dir_all, File},
     io::{BufWriter, Seek, Write},
     path::Path,
-    time::Instant,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 #[repr(C, packed)]
 struct SequenceHeader {
@@ -35,93 +34,14 @@ struct BlockHeader {
     score: f64,
 }
 
-fn print_alignment_block(
-    mmap: &Mmap,
+#[derive(Clone, Debug)]
+pub struct BlockResult {
+    /// File offset to block in binary MAF
     offset: u64,
-    header: &BlockHeader,
-    block_start: u32,
-    query_start: u32,
-    query_end: u32,
-    species_map: &HashMap<u16, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let block_size = header.seq_length as usize;
-    let n_seqs = header.n_seqs as usize;
-    let seq_header_size = std::mem::size_of::<SequenceHeader>();
-
-    // Calculate relative positions within the block
-    let start_pos = if query_start > block_start {
-        (query_start - block_start) as usize
-    } else {
-        0
-    };
-    let end_pos = ((query_end - block_start) as usize).min(block_size);
-
-    debug!(
-        ?header,
-        block_start,
-        block_size,
-        query_start,
-        query_end,
-        start_pos,
-        end_pos,
-        "Processing alignment block"
-    );
-
-    if start_pos < block_size && start_pos < end_pos {
-        // The start of the sequence data (species headers and aligned sequences)
-        let data_start = offset as usize + std::mem::size_of::<BlockHeader>();
-
-        for i in 0..n_seqs {
-            let seq_start = data_start + (i * (seq_header_size + block_size));
-
-            // Read sequence header
-            let species_id = unsafe {
-                trace!(seq_start, "Reading sequence header");
-                let data = &mmap[seq_start..seq_start + std::mem::size_of::<u16>()];
-                trace!(data = ?data, "Raw bytes");
-                let ptr = data.as_ptr();
-                let id = std::ptr::read_unaligned(ptr as *const u16);
-                trace!(species_id = id);
-                id
-            };
-
-            // Read sequence data
-            let seq_data =
-                &mmap[seq_start + seq_header_size..seq_start + seq_header_size + block_size];
-            trace!(seq_data = ?seq_data, "Raw sequence data");
-
-            match std::str::from_utf8(seq_data) {
-                Ok(sequence) => {
-                    trace!(sequence, "Parsed sequence");
-                    if start_pos < sequence.len() {
-                        let display_end = end_pos.min(sequence.len());
-                        let sequence_slice = &sequence[start_pos..display_end];
-
-                        match species_map.get(&species_id) {
-                            Some(species_name) => {
-                                println!("{}\t{}", species_name, sequence_slice);
-                            }
-                            None => {
-                                error!(species_id, "Could not find species name");
-                                return Err(format!(
-                                    "Could not find species name for {species_id}"
-                                )
-                                .into());
-                            }
-                        }
-                    } else {
-                        warn!(
-                            start_pos,
-                            sequence_len = sequence.len(),
-                            "Start position exceeds sequence length"
-                        );
-                    }
-                }
-                Err(e) => error!(error = %e, sequence_number = i, "Error reading sequence"),
-            }
-        }
-    }
-    Ok(())
+    /// block metadata (sequences, length, score)
+    header: BlockHeader,
+    /// starting position of block in genome
+    start_pos: u32,
 }
 
 pub fn convert_to_binary(
@@ -249,13 +169,13 @@ pub fn convert_to_binary(
     Ok(())
 }
 
-struct IndexedMafReader {
+pub struct IndexedMafDb {
     mmap: Mmap,
     index: FastIndex,
 }
 
-impl IndexedMafReader {
-    fn open(chr: &str, data_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+impl IndexedMafDb {
+    pub fn open(chr: &str, data_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let data_path = data_dir.join(format!("{}.bin", chr));
         let index_path = data_dir.join(format!("{}.index", chr));
 
@@ -274,13 +194,8 @@ impl IndexedMafReader {
 
     /// Find alignment blocks overlapping a genomic interval
     ///
-    /// Returns list of (offset, header, start_pos) tuples where:
-    /// - offset: file offset to block in binary MAF
-    /// - header: block metadata (sequences, length, score)
-    /// - start_pos: starting position of block in genome
-    ///
     /// Note: Positions are 1-based, [start, end] coordinates
-    fn find_blocks(&self, start: u32, end: u32) -> Vec<(u64, BlockHeader, u32)> {
+    pub fn find_blocks(&self, start: u32, end: u32) -> Vec<BlockResult> {
         let internal_start = start - 1; // Convert 1-indexed to 0-indexed
         let internal_end = end; // end stays same as exclusive end = inclusive end + 1
         debug!(
@@ -298,74 +213,112 @@ impl IndexedMafReader {
             .map(|loc| {
                 let header =
                     unsafe { &*(self.mmap[loc.offset as usize..].as_ptr() as *const BlockHeader) };
-                (loc.offset, *header, loc.start)
+                BlockResult {
+                    offset: loc.offset,
+                    header: *header,
+                    start_pos: loc.start,
+                }
             })
             .collect()
     }
 
-    fn species_map(&self) -> &HashMap<u16, String> {
+    /// Get the alignments in a region.
+    pub fn get_alignments(
+        &self,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+        let seq_header_size = std::mem::size_of::<SequenceHeader>();
+        let species_map = self.index.species_map();
+
+        let mut alignments: Vec<(String, String)> = Vec::new();
+
+        let blocks = self.find_blocks(start, end);
+        for block in blocks {
+            let block_size = block.header.seq_length as usize;
+            let n_seqs = block.header.n_seqs as usize;
+
+            // Calculate relative positions within the block
+            let start_pos = if start > block.start_pos {
+                (start - block.start_pos) as usize
+            } else {
+                0
+            };
+            let end_pos = ((end - block.start_pos) as usize).min(block_size);
+
+            trace!(
+                ?block.header,
+                block.start_pos,
+                block_size,
+                start,
+                end,
+                start_pos,
+                end_pos,
+                "Processing alignment block"
+            );
+
+            if start_pos < block_size && start_pos < end_pos {
+                // The start of the sequence data (species headers and aligned sequences)
+                let data_start = block.offset as usize + std::mem::size_of::<BlockHeader>();
+
+                for i in 0..n_seqs {
+                    let seq_start = data_start + (i * (seq_header_size + block_size));
+
+                    // Read sequence header
+                    let species_id = unsafe {
+                        trace!(seq_start, "Reading sequence header");
+                        let data = &self.mmap[seq_start..seq_start + std::mem::size_of::<u16>()];
+                        trace!(data = ?data, "Raw bytes");
+                        let ptr = data.as_ptr();
+                        let id = std::ptr::read_unaligned(ptr as *const u16);
+                        trace!(species_id = id);
+                        id
+                    };
+
+                    // Read sequence data
+                    let seq_data = &self.mmap
+                        [seq_start + seq_header_size..seq_start + seq_header_size + block_size];
+                    trace!(seq_data = ?seq_data, "Raw sequence data");
+
+                    match std::str::from_utf8(seq_data) {
+                        Ok(sequence) => {
+                            trace!(sequence, "Parsed sequence");
+                            if start_pos < sequence.len() {
+                                let display_end = end_pos.min(sequence.len());
+                                let sequence_slice = &sequence[start_pos..display_end];
+
+                                match species_map.get(&species_id) {
+                                    Some(species_name) => {
+                                        alignments.push((
+                                            species_name.to_string(),
+                                            sequence_slice.to_string(),
+                                        ));
+                                    }
+                                    None => {
+                                        error!(species_id, "Could not find species name");
+                                        return Err(format!(
+                                            "Could not find species name for {species_id}"
+                                        )
+                                        .into());
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    start_pos,
+                                    sequence_len = sequence.len(),
+                                    "Start position exceeds sequence length"
+                                );
+                            }
+                        }
+                        Err(e) => error!(error = %e, sequence_number = i, "Error reading sequence"),
+                    }
+                }
+            }
+        }
+        Ok(alignments)
+    }
+
+    pub fn species_map(&self) -> &HashMap<u16, String> {
         self.index.species_map()
     }
-}
-
-pub fn query_command(
-    chromosome: &str,
-    start: u32,
-    end: u32,
-    data_dir: &Path,
-    verbose: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let total_time = Instant::now();
-
-    let reader = IndexedMafReader::open(chromosome, data_dir)?;
-    if verbose {
-        debug!(elapsed = ?total_time.elapsed(), "Reader initialization");
-    }
-
-    // Using indexed query to find overlapping blocks.
-    let find_start = Instant::now();
-    let blocks = reader.find_blocks(start, end);
-    if verbose {
-        debug!(elapsed = ?find_start.elapsed(), "Finding blocks");
-    }
-
-    if blocks.is_empty() {
-        info!(chromosome, start, end, "No alignment blocks found");
-        return Ok(());
-    }
-
-    debug!(block_count = blocks.len(), "Found overlapping blocks");
-
-    let process_start = Instant::now();
-    for (offset, header, block_start) in blocks {
-        let block_start_time = Instant::now();
-        print_alignment_block(
-            &reader.mmap,
-            offset,
-            &header,
-            block_start,
-            start,
-            end,
-            reader.species_map(),
-        )?;
-        if verbose {
-            debug!(
-                offset,
-                elapsed = ?block_start_time.elapsed(),
-                "Processed block"
-            );
-        }
-    }
-    if verbose {
-        debug!(
-            elapsed = ?process_start.elapsed(),
-            "Total block processing"
-        );
-        info!(
-            elapsed = ?total_time.elapsed(),
-            "Total query time"
-        );
-    }
-
-    Ok(())
 }
