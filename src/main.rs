@@ -1,18 +1,14 @@
-use biomaf::binary::{convert_to_binary, IndexedMafDb};
-use biomaf::index::FastIndex;
-use biomaf::io::{InputFile, MafReader, OutputFile};
-use biomaf::statistics::{calc_alignment_statistics, AlignmentStatistics};
+// main.rs
+use biomaf::binary::{convert_to_binary, query_alignments};
+use biomaf::binary::{stats_command, SpeciesDictionary};
+use biomaf::io::MafReader;
 use clap::Parser;
-use csv::ReaderBuilder;
-use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use hgindex::BinningIndex;
+use std::collections::HashSet;
 use std::fs::create_dir_all;
 use std::fs::File;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
-use tracing::{info, trace};
 
 #[derive(Parser)]
 #[command(name = "maftools")]
@@ -92,10 +88,6 @@ enum Commands {
         /// Directory containing binary MAF files
         #[arg(short, long, default_value = "maf.mmdb")]
         data_dir: PathBuf,
-
-        /// Print timing information
-        #[arg(short, long)]
-        verbose: bool,
     },
 
     /// Debug an index file's structure
@@ -252,138 +244,15 @@ fn split_maf(
     })
 }
 
-pub fn query_command(
-    chrom: &str,
-    start: u32,
-    end: u32,
-    data_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let db = IndexedMafDb::open(&chrom, data_dir)?;
-    let total_time = Instant::now();
-    let alignments = db.get_alignments(start, end)?;
-    let mut all_species = HashSet::new();
-    for (species, seq) in &alignments {
-        println!("{}\t{}", species, seq);
-        all_species.insert(species.clone());
-    }
-
-    // let region_stats = calc_alignment_statistics(alignments, &all_species, chrom.to_string(), start, end);
-    // dbg!(region_stats);
-    info!("Total elapsed {:?}", total_time.elapsed());
-    Ok(())
-}
-
-/// Estimates number of records in a TSV/CSV file
-fn estimate_record_count(path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
-    let file_size = file.metadata()?.len();
-
-    // Sample first few lines to get average line length
-    let input_file = InputFile::new(path);
-    let mut reader = input_file.reader()?;
-    let mut buffer = String::new();
-    let mut total_bytes = 0;
-    let mut line_count = 0;
-    const SAMPLE_LINES: usize = 100;
-
-    while line_count < SAMPLE_LINES {
-        buffer.clear();
-        let bytes_read = reader.read_line(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        } // EOF
-
-        // Skip comments
-        if buffer.starts_with('#') {
-            continue;
-        }
-
-        total_bytes += bytes_read;
-        line_count += 1;
-    }
-
-    if line_count == 0 {
-        return Ok(0);
-    }
-
-    // Calculate average bytes per record
-    let avg_bytes_per_record = total_bytes as f64 / line_count as f64;
-    let estimated_records = (file_size as f64 / avg_bytes_per_record).ceil() as u64;
-
-    Ok(estimated_records)
-}
-
-pub fn stats_command(
-    regions: &Path,
-    output: &Path,
-    species: HashSet<String>,
-    data_dir: &Path,
-    verbose: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let total_time = Instant::now();
-
-    // Estimate total records for progress bar
-    let estimated_records = estimate_record_count(regions)?;
-    let progress = ProgressBar::new(estimated_records);
-    progress.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} records ({eta})")?
-        .progress_chars("#>-"));
-
-    // Setup input for reading BED file
-    let input_file = InputFile::new(regions);
-    let buf_reader = input_file.reader()?;
-
-    let output_file = OutputFile::new(output);
-    let mut stats_writer = AlignmentStatistics::new(output_file, species.clone())?;
-
-    let mut reader = ReaderBuilder::new()
-        .comment(Some(b'#'))
-        .delimiter(b'\t')
-        .has_headers(false)
-        .from_reader(buf_reader);
-
-    // Cache indexed MAF databases by chromosome
-    let mut index_map: HashMap<String, IndexedMafDb> = HashMap::new();
-
-    for result in reader.records() {
-        let record = result?;
-        let chrom = record[0].to_string();
-        let start: u32 = record[1].parse()?;
-        let end: u32 = record[2].parse()?;
-
-        // Get or create index for this chromosome
-        let index = match index_map.entry(chrom.clone()) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => v.insert(IndexedMafDb::open(&chrom, data_dir)?),
-        };
-
-        // Using indexed query to find overlapping blocks
-        let find_start = Instant::now();
-        let alignments = index.get_alignments(start, end)?;
-        if verbose {
-            trace!(elapsed = ?find_start.elapsed(), "Finding blocks");
-        }
-
-        if !alignments.is_empty() {
-            // Calculate statistics for this region
-            let region_stats = calc_alignment_statistics(alignments, &species, chrom, start, end);
-            // Write statistics to output file
-            stats_writer.write_stats(&region_stats)?;
-        }
-
-        progress.inc(1);
-    }
-
-    progress.finish_with_message("Processing complete");
-
-    if verbose {
-        info!("Total elapsed {:?}", total_time.elapsed());
-    }
-
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    //match check_bin_offsets() {
+    //    Ok(_) => {
+    //        println!("No bin offset clashes detected.");
+    //    }
+    //    Err(e) => {
+    //        println!("Error: {}", e);
+    //    }
+    //}
     let cli = Cli::parse();
 
     // Set up tracing level based on verbosity argument
@@ -438,21 +307,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("End position must be greater than start position");
                 std::process::exit(1);
             }
-            query_command(&chromosome, start, end, &data_dir)?;
+            query_alignments(&data_dir, &chromosome, start, end)?;
         }
         Commands::Stats {
             regions,
             output,
             species,
             data_dir,
-            verbose,
         } => {
             let species = HashSet::from_iter(species.split(',').map(String::from));
-            stats_command(&regions, &output, species, &data_dir, verbose)?
+            stats_command(&regions, &output, species, &data_dir)?
         }
         Commands::DebugIndex { path } => {
-            let index = FastIndex::open(&path)?;
-            index.debug_print();
+            let _index = BinningIndex::<SpeciesDictionary>::open(&path)?;
+            todo!()
         }
     }
 

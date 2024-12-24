@@ -128,8 +128,8 @@ pub fn calc_alignment_statistics(
             continue;
         }
 
-        for j in (i + 1)..alignments.len() {
-            let (sp2, seq2) = &alignments[j];
+        for alignment in alignments.iter().skip(i + 1) {
+            let (sp2, seq2) = alignment;
             if !species.contains(sp2) {
                 continue;
             }
