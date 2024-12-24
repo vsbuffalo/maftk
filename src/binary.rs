@@ -8,13 +8,13 @@ use std::fs::File;
 use std::io::BufRead;
 use std::time::Instant;
 use std::{collections::HashSet, path::Path};
-use tracing::{info, trace};
+use tracing::info;
 
 use hgindex::GenomicDataStore;
 
 use crate::io::{InputFile, MafReader, OutputFile, Strand};
 use crate::statistics::{
-    calc_alignment_statistics, calc_alignment_statistics_bytes, AlignmentStatistics,
+    calc_alignment_block_statistics, compare_bases, is_gap, AlignmentStatistics, RegionStats,
 };
 
 // Species dictionary to avoid storing repetitive strings
@@ -69,6 +69,14 @@ pub struct MafBlock {
 }
 
 impl MafBlock {
+    pub fn calc_stats(
+        &self,
+        start: Option<u32>,
+        end: Option<u32>,
+        species_indices: &HashSet<u32>,
+    ) -> Option<RegionStats> {
+        calc_alignment_block_statistics(self, species_indices, start, end)
+    }
     pub fn pretty_print_alignments(
         &self,
         species_dict: &SpeciesDictionary,
@@ -83,9 +91,13 @@ impl MafBlock {
                     .get_species(aligned.species_idx)
                     .unwrap_or(label);
                 (
+                    // species name
                     species_name.to_string(),
+                    // aligned sequence
                     aligned.text.clone(),
+                    // start position
                     aligned.start,
+                    // end position
                     aligned.strand,
                 )
             })
@@ -96,7 +108,8 @@ impl MafBlock {
         }
 
         // Get reference sequence (first sequence)
-        let reference = &alignments[0].1;
+        let ref_alignment = &alignments[0];
+        let reference = &ref_alignment.1;
 
         // Calculate the maximum identifier length for padding
         let max_id_len = alignments
@@ -119,7 +132,7 @@ impl MafBlock {
             // Calculate and format coordinates
             let strand = if *is_reverse { "-" } else { "+" };
             let coord_label = format!(
-                "{:<8}: {:>8} {}",
+                "{:<9}: {:>10} {}",
                 id.chars().take(8).collect::<String>(),
                 start_pos,
                 strand
@@ -135,11 +148,17 @@ impl MafBlock {
             }
 
             // Compare with reference sequence and color-code
-            for (ref_base, query_base) in reference.chars().zip(sequence.chars()) {
-                let colored_base = match (ref_base, query_base) {
-                    (r, q) if r == q => query_base.to_string().green(),
-                    ('-', q) | (q, '-') => q.to_string().yellow(),
-                    _ => query_base.to_string().red(),
+            for (ref_byte, query_byte) in
+                reference.as_bytes().iter().zip(sequence.as_bytes().iter())
+            {
+                let colored_base = if is_gap(*ref_byte) && is_gap(*query_byte) {
+                    (*query_byte as char).to_string().green()
+                } else if is_gap(*ref_byte) || is_gap(*query_byte) {
+                    (*query_byte as char).to_string().yellow()
+                } else if compare_bases(*ref_byte, *query_byte) {
+                    (*query_byte as char).to_string().green()
+                } else {
+                    (*query_byte as char).to_string().red()
                 };
                 print!("{}", colored_base);
             }
@@ -226,16 +245,18 @@ pub fn query_alignments(
 ) -> Result<Vec<MafBlock>, Box<dyn std::error::Error>> {
     let total_time = Instant::now();
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
-    let blocks = store.get_overlapping(chrom, start - 1, end);
+    let blocks: Vec<MafBlock> = store.get_overlapping(chrom, start - 1, end);
     let query_time = total_time.elapsed();
 
     // Use the store's metadata to get species names
     let species_dict = store.metadata().unwrap();
 
     let mut alignments = Vec::new();
-    for block in blocks {
+    for (i, block) in blocks.into_iter().enumerate() {
+        println!("[block {}, score {}]", i, block.score);
         block.pretty_print_alignments(species_dict)?;
         alignments.push(block);
+        println!();
     }
     // Print legend
     println!("\nLegend:");
@@ -296,7 +317,7 @@ pub fn stats_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
 
-    // Estimate total records for progress bar
+    // Setup progress bar
     let estimated_records = estimate_record_count(regions)?;
     let progress = ProgressBar::new(estimated_records);
     progress.set_style(ProgressStyle::default_bar()
@@ -316,87 +337,44 @@ pub fn stats_command(
         .has_headers(false)
         .from_reader(buf_reader);
 
-    // Group regions by chromosome
-    let mut chrom_regions: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
-
-    // First pass: collect regions by chromosome
-    for result in reader.records() {
-        let record = result?;
-        let chrom = record[0].to_string();
-        let start: u32 = record[1].parse()?;
-        let end: u32 = record[2].parse()?;
-
-        chrom_regions.entry(chrom).or_default().push((start, end));
-    }
-
-    // Sort regions within each chromosome
-    for regions in chrom_regions.values_mut() {
-        regions.sort_by_key(|&(start, _)| start);
-    }
-
+    // Open store and get species dictionary
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
     let species_dict = store
         .metadata()
         .expect("Missing species dictionary")
         .clone();
 
-    // Convert species names to indices up front
+    // Convert species names to indices
     let species_indices: HashSet<u32> = species
         .iter()
         .filter_map(|name| species_dict.species_to_index.get(name).copied())
         .collect();
 
-    // Process each chromosome's regions
-    for (chrom, regions) in chrom_regions {
-        // Open chromosome file once
-        if let Err(_) = store.open_chrom_file(&chrom) {
+    // Process each region
+    for result in reader.records() {
+        let record = result?;
+        let chrom = record[0].to_string();
+        let start: u32 = record[1].parse()?;
+        let end: u32 = record[2].parse()?;
+
+        // Get overlapping blocks
+        let blocks: Vec<MafBlock> = store.get_overlapping(&chrom, start, end);
+
+        if blocks.is_empty() {
             continue;
         }
 
-        // Keep track of current blocks
-        let mut current_blocks: Vec<MafBlock> = Vec::new();
-
-        for &(start, end) in &regions {
-            // Remove blocks that can't overlap anymore
-            current_blocks.retain(|block| {
-                let block_end = block.sequences[0].start + block.sequences[0].size;
-                block_end >= start
-            });
-
-            // Only fetch new blocks if needed
-            if current_blocks.is_empty() || current_blocks.last().unwrap().sequences[0].start < end
+        // Process each block independently
+        for block in blocks {
+            if let Some(mut block_stats) =
+                block.calc_stats(Some(start), Some(end), &species_indices)
             {
-                let new_blocks = store.get_overlapping(&chrom, start, end);
-                current_blocks.extend(new_blocks);
-            }
-
-            // Process current region with available blocks
-            let alignments: Vec<(u32, String)> = current_blocks
-                .iter()
-                .filter(|block| {
-                    let block_start = block.sequences[0].start;
-                    let block_end = block_start + block.sequences[0].size;
-                    block_start <= end && block_end >= start
-                })
-                .flat_map(|block| {
-                    block
-                        .sequences
-                        .iter()
-                        .map(|aligned| (aligned.species_idx, aligned.text.clone()))
-                })
-                .collect();
-
-            let region_stats = calc_alignment_statistics_bytes(
-                alignments,
-                &species_indices,
-                chrom.clone(),
-                start,
-                end,
-            );
-
-            stats_writer.write_stats(&region_stats, &species_dict)?;
-            progress.inc(1);
+                block_stats.chrom = chrom.clone(); // Set chromosome
+                stats_writer.write_stats(&block_stats, &species_dict)?;
+            };
         }
+
+        progress.inc(1);
     }
 
     progress.finish_with_message("Processing complete");

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use thiserror::Error;
 
-use crate::binary::SpeciesDictionary;
+use crate::binary::{MafBlock, SpeciesDictionary};
 use crate::io::OutputFile;
 
 #[derive(Error, Debug)]
@@ -17,9 +17,9 @@ pub enum StatsError {
 
 #[derive(Clone, Default, Debug)]
 pub struct PairwiseStats {
-    substitutions: u32,
-    gaps: u32,
-    valid_positions: u32,
+    pub(crate) substitutions: u32,
+    pub(crate) gaps: u32,
+    pub(crate) valid_positions: u32,
 }
 
 impl PairwiseStats {
@@ -42,17 +42,15 @@ impl PairwiseStats {
 
 #[derive(Clone, Default, Debug)]
 pub struct RegionStats {
-    chrom: String,
-    start: u32,
-    end: u32,
-    pairwise_stats: HashMap<(u32, u32), PairwiseStats>,
+    pub(crate) chrom: String,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) pairwise_stats: HashMap<(u32, u32), PairwiseStats>,
 }
 
 pub struct AlignmentStatistics {
     writer: Writer<Box<dyn Write>>,
     species: HashSet<String>,
-    // Store the species indices in the order they appear in headers
-    species_indices: Vec<u32>,
 }
 
 impl AlignmentStatistics {
@@ -61,14 +59,7 @@ impl AlignmentStatistics {
             .delimiter(b'\t')
             .from_writer(output.writer()?);
 
-        // We'll fill species_indices when we write the header
-        let species_indices = Vec::new();
-
-        let mut stats = Self {
-            writer,
-            species,
-            species_indices,
-        };
+        let mut stats = Self { writer, species };
         stats.write_header()?;
         Ok(stats)
     }
@@ -144,124 +135,288 @@ impl AlignmentStatistics {
     }
 }
 
-pub fn calc_alignment_statistics(
-    alignments: Vec<(u32, String)>,
-    species_indices: &HashSet<u32>,
-    chrom: String,
-    start: u32,
-    end: u32,
-) -> RegionStats {
-    let mut stats = RegionStats {
-        chrom,
-        start,
-        end,
-        pairwise_stats: HashMap::new(),
-    };
-
-    for i in 0..alignments.len() {
-        let (sp1_idx, seq1) = &alignments[i];
-        if !species_indices.contains(sp1_idx) {
-            continue;
-        }
-
-        for alignment in alignments.iter().skip(i + 1) {
-            let (sp2_idx, seq2) = alignment;
-            if !species_indices.contains(sp2_idx) {
-                continue;
-            }
-
-            let mut pair_stats = PairwiseStats::default();
-
-            // Rest of sequence comparison logic stays the same...
-            for (c1, c2) in seq1.chars().zip(seq2.chars()) {
-                match (c1, c2) {
-                    ('.', '.') | ('-', '-') => continue,
-                    ('.', _) | ('-', _) | (_, '.') | (_, '-') => pair_stats.gaps += 1,
-                    (b1, b2) if b1 != b2 => {
-                        pair_stats.substitutions += 1;
-                        pair_stats.valid_positions += 1;
-                    }
-                    _ => pair_stats.valid_positions += 1,
-                }
-            }
-
-            let species_pair = if sp1_idx < sp2_idx {
-                (*sp1_idx, *sp2_idx)
-            } else {
-                (*sp2_idx, *sp1_idx)
-            };
-            stats.pairwise_stats.insert(species_pair, pair_stats);
-        }
-    }
-
-    stats
+pub fn is_gap(b: u8) -> bool {
+    b == b'-' || b == b'.'
 }
 
-pub fn calc_alignment_statistics_bytes(
-    alignments: Vec<(u32, String)>,
+pub fn compare_bases(b1: u8, b2: u8) -> bool {
+    // First check if either is a gap
+    if is_gap(b1) || is_gap(b2) {
+        return false; // gaps are handled separately
+    }
+
+    // Convert both to uppercase for comparison
+    let b1_upper = b1.to_ascii_uppercase();
+    let b2_upper = b2.to_ascii_uppercase();
+
+    b1_upper == b2_upper
+}
+
+pub fn calc_alignment_block_statistics(
+    block: &MafBlock,
     species_indices: &HashSet<u32>,
-    chrom: String,
-    start: u32,
-    end: u32,
-) -> RegionStats {
+    region_start: Option<u32>,
+    region_end: Option<u32>,
+) -> Option<RegionStats> {
+    let ref_seq = &block.sequences[0];
+    let block_start = ref_seq.start;
+    let block_end = block_start + ref_seq.size;
+
+    // If region is specified, calculate overlap
+    let (start_offset, length) = if let (Some(start), Some(end)) = (region_start, region_end) {
+        // Check if there's any overlap
+        if end <= block_start || start >= block_end {
+            return None;
+        }
+
+        // Calculate overlap region
+        let overlap_start = start.max(block_start);
+        let overlap_end = end.min(block_end);
+
+        // Calculate offset and length
+        (
+            (overlap_start - block_start) as usize,
+            (overlap_end - overlap_start) as usize,
+        )
+    } else {
+        // Use full sequence if no region specified
+        (0, ref_seq.size as usize)
+    };
+
     let mut stats = RegionStats {
-        chrom,
-        start,
-        end,
+        chrom: String::new(),
+        start: block_start + start_offset as u32,
+        end: block_start + start_offset as u32 + length as u32,
         pairwise_stats: HashMap::new(),
     };
 
-    for i in 0..alignments.len() {
-        let (sp1_idx, seq1) = &alignments[i];
-        if !species_indices.contains(sp1_idx) {
+    for i in 0..block.sequences.len() {
+        let seq1 = &block.sequences[i];
+        if !species_indices.contains(&seq1.species_idx) {
             continue;
         }
-        // Convert to bytes once
-        let seq1_bytes = seq1.as_bytes();
+        // Use slice of the sequence for the region of interest
+        let seq1_bytes = &seq1.text.as_bytes()[start_offset..start_offset + length];
 
-        for alignment in alignments.iter().skip(i + 1) {
-            let (sp2_idx, seq2) = alignment;
-            if !species_indices.contains(sp2_idx) {
+        for j in (i + 1)..block.sequences.len() {
+            let seq2 = &block.sequences[j];
+            if !species_indices.contains(&seq2.species_idx) {
                 continue;
             }
-            let seq2_bytes = seq2.as_bytes();
+            // Use slice of the sequence for the region of interest
+            let seq2_bytes = &seq2.text.as_bytes()[start_offset..start_offset + length];
 
             let mut pair_stats = PairwiseStats::default();
 
-            // Use byte comparison instead of char comparison
             for (b1, b2) in seq1_bytes.iter().zip(seq2_bytes.iter()) {
-                match (b1, b2) {
-                    (b'.' | b'-', b'.' | b'-') => continue,
-                    (b'.' | b'-', _) | (_, b'.' | b'-') => pair_stats.gaps += 1,
-                    (b1, b2) => {
-                        // Simple ASCII uppercase comparison
-                        let b1_upper = if *b1 >= b'a' && *b1 <= b'z' {
-                            b1 - 32
-                        } else {
-                            *b1
-                        };
-                        let b2_upper = if *b2 >= b'a' && *b2 <= b'z' {
-                            b2 - 32
-                        } else {
-                            *b2
-                        };
-                        if b1_upper != b2_upper {
-                            pair_stats.substitutions += 1;
-                            pair_stats.valid_positions += 1;
-                        } else {
-                            pair_stats.valid_positions += 1;
-                        }
+                if is_gap(*b1) && is_gap(*b2) {
+                    continue; // Matching gaps
+                } else if is_gap(*b1) || is_gap(*b2) {
+                    pair_stats.gaps += 1; // One gap
+                } else {
+                    // Both are bases
+                    pair_stats.valid_positions += 1;
+                    if !compare_bases(*b1, *b2) {
+                        pair_stats.substitutions += 1;
                     }
                 }
             }
 
-            let species_pair = if sp1_idx < sp2_idx {
-                (*sp1_idx, *sp2_idx)
+            let species_pair = if seq1.species_idx < seq2.species_idx {
+                (seq1.species_idx, seq2.species_idx)
             } else {
-                (*sp2_idx, *sp1_idx)
+                (seq2.species_idx, seq1.species_idx)
             };
             stats.pairwise_stats.insert(species_pair, pair_stats);
         }
     }
-    stats
+
+    Some(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::binary::AlignedSequence;
+
+    use super::*;
+    use std::collections::HashSet;
+
+    // Helper function to create a MafBlock with two sequences
+    fn create_test_block(seq1: &str, seq2: &str) -> MafBlock {
+        MafBlock {
+            score: 0.0,
+            sequences: vec![
+                AlignedSequence {
+                    species_idx: 0,
+                    start: 0,
+                    size: seq1.len() as u32,
+                    strand: false,
+                    src_size: seq1.len() as u32,
+                    text: seq1.to_string(),
+                },
+                AlignedSequence {
+                    species_idx: 1,
+                    start: 0,
+                    size: seq2.len() as u32,
+                    strand: false,
+                    src_size: seq2.len() as u32,
+                    text: seq2.to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_perfect_match() {
+        let block = create_test_block("ATCG", "ATCG");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 0);
+        assert_eq!(pair_stats.gaps, 0);
+        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.substitution_rate(), 0.0);
+        assert_eq!(pair_stats.gap_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_all_mismatches() {
+        let block = create_test_block("ATCG", "TAGC");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 4);
+        assert_eq!(pair_stats.gaps, 0);
+        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.substitution_rate(), 1.0);
+        assert_eq!(pair_stats.gap_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_single_gap() {
+        let block = create_test_block("A-TCG", "AATCG");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 0);
+        assert_eq!(pair_stats.gaps, 1);
+        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.substitution_rate(), 0.0);
+        assert_eq!(pair_stats.gap_rate(), 0.2); // 1 gap out of 5 total positions
+    }
+
+    #[test]
+    fn test_multiple_gaps() {
+        let block = create_test_block("A-TC-G", "A-TC-G");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 0);
+        assert_eq!(pair_stats.gaps, 0); // Matching gaps don't count
+        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.substitution_rate(), 0.0);
+        assert_eq!(pair_stats.gap_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_mixed_case() {
+        let block = create_test_block("AtCg", "aTcG");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 0); // Should handle case-insensitive comparison
+        assert_eq!(pair_stats.gaps, 0);
+        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.substitution_rate(), 0.0);
+        assert_eq!(pair_stats.gap_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_gaps_and_mismatches() {
+        let block = create_test_block("A-TCG", "AT-CG");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 0);
+        assert_eq!(pair_stats.gaps, 2); // Two non-matching gaps
+        assert_eq!(pair_stats.valid_positions, 3);
+        assert_eq!(pair_stats.substitution_rate(), 0.0);
+        assert_eq!(pair_stats.gap_rate(), 0.4); // 2 gaps out of 5 total positions
+    }
+
+    #[test]
+    fn test_dot_gaps() {
+        let block = create_test_block("A.TCG", "AATCG");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 0);
+        assert_eq!(pair_stats.gaps, 1); // Dots count as gaps
+        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.substitution_rate(), 0.0);
+        assert_eq!(pair_stats.gap_rate(), 0.2);
+    }
+
+    #[test]
+    fn test_empty_sequences() {
+        let block = create_test_block("", "");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 0);
+        assert_eq!(pair_stats.gaps, 0);
+        assert_eq!(pair_stats.valid_positions, 0);
+        assert_eq!(pair_stats.substitution_rate(), 0.0);
+        assert_eq!(pair_stats.gap_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_mixed_case_stats() {
+        let block = create_test_block("ATCGatcg", "atcgATCG");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = block.calc_stats(None, None, &species_indices).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(
+            pair_stats.substitutions, 0,
+            "Case difference should not count as substitution"
+        );
+        assert_eq!(pair_stats.valid_positions, 8);
+    }
+
+    #[test]
+    fn test_mixed_case_with_gaps_stats() {
+        let block = create_test_block("A-ccG", "AtC-g");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = block.calc_stats(None, None, &species_indices).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(
+            pair_stats.substitutions, 0,
+            "Case difference should not count as substitution"
+        );
+        assert_eq!(pair_stats.gaps, 2);
+        assert_eq!(pair_stats.valid_positions, 3);
+    }
+
+    #[test]
+    fn test_mixed_dots_and_dashes() {
+        let block = create_test_block("A.TcG", "AtC-g");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats = block.calc_stats(None, None, &species_indices).unwrap();
+        dbg!(&stats);
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 1);
+        assert_eq!(pair_stats.gaps, 2);
+        assert_eq!(pair_stats.valid_positions, 3);
+    }
 }
