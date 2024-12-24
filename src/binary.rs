@@ -50,26 +50,20 @@ impl SpeciesDictionary {
 
 // Compact metadata for each sequence in the alignment
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SequenceMetadata {
+pub struct AlignedSequence {
     pub species_idx: u32, // Index into species dictionary
     pub start: u32,       // Start position in source sequence
     pub size: u32,        // Size of aligning region
     pub strand: bool,     // false for forward (+), true for reverse (-)
     pub src_size: u32,    // Total size of source sequence
-}
-
-// Complete metadata for an alignment block
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AlignmentMetadata {
-    pub score: f32,                       // Alignment score
-    pub sequences: Vec<SequenceMetadata>, // Metadata for each sequence
+    pub text: String,     // Raw sequence
 }
 
 // Modified MafBlock to include metadata
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MafBlock {
-    pub metadata: AlignmentMetadata,
-    pub sequences: Vec<String>,
+    pub score: f32,
+    pub sequences: Vec<AlignedSequence>,
 }
 
 pub fn convert_to_binary(
@@ -95,7 +89,6 @@ pub fn convert_to_binary(
         let chr = ref_seq.src.split('.').nth(1).ok_or("Invalid ref name")?;
 
         // Convert sequences to metadata + alignment strings
-        let mut sequence_metadata = Vec::new();
         let mut alignment_strings = Vec::new();
 
         for seq in &block.sequences {
@@ -108,23 +101,20 @@ pub fn convert_to_binary(
                 return Err("Missing metadata".into());
             };
 
-            sequence_metadata.push(SequenceMetadata {
+            alignment_strings.push(AlignedSequence {
                 species_idx,
                 start: seq.start as u32,
                 size: seq.size as u32,
                 strand: matches!(seq.strand, Strand::Reverse),
                 src_size: seq.src_size as u32,
+                text: seq.text.clone(),
             });
-            alignment_strings.push(seq.text.clone());
         }
 
-        let metadata = AlignmentMetadata {
-            score: block.score.unwrap_or(0.0) as f32,
-            sequences: sequence_metadata,
-        };
+        let score = block.score.unwrap_or(0.0) as f32;
 
         let record = MafBlock {
-            metadata,
+            score,
             sequences: alignment_strings,
         };
 
@@ -208,10 +198,15 @@ pub fn query_alignments(
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
     let blocks = store.get_overlapping(chrom, start - 1, end);
 
+    // Use the store's metadata to get species names
+    let species_dict = store.metadata().unwrap();
+
     let mut alignments = Vec::new();
     for block in blocks {
-        for sequence in block.sequences {
-            alignments.push((format!("seq_{}", alignments.len()), sequence));
+        for meta in block.sequences.iter() {
+            if let Some(species_name) = species_dict.get_species(meta.species_idx) {
+                alignments.push((species_name.to_string(), meta.text.clone()));
+            }
         }
     }
 
@@ -293,7 +288,7 @@ pub fn stats_command(
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
 
     // Get species dictionary from metadata
-    let mut species_dict = SpeciesDictionary::new();
+    let species_dict = SpeciesDictionary::new();
 
     // Process each region
     for result in reader.records() {
@@ -313,15 +308,13 @@ pub fn stats_command(
                 .into_iter()
                 .flat_map(|block| {
                     block
-                        .metadata
                         .sequences
                         .iter()
-                        .zip(block.sequences.iter())
-                        .filter_map(|(meta, seq)| {
+                        .filter_map(|aligned| {
                             // Get species name from dictionary
                             species_dict
-                                .get_species(meta.species_idx)
-                                .map(|species| (species.to_string(), seq.clone()))
+                                .get_species(aligned.species_idx)
+                                .map(|species| (species.to_string(), aligned.text.clone()))
                         })
                         .collect::<Vec<_>>()
                 })
