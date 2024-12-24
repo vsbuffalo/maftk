@@ -26,6 +26,12 @@ pub struct SpeciesDictionary {
     index_to_species: Vec<String>,
 }
 
+impl Default for SpeciesDictionary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SpeciesDictionary {
     pub fn new() -> Self {
         Self {
@@ -73,7 +79,7 @@ impl MafBlock {
         &self,
         start: Option<u32>,
         end: Option<u32>,
-        species_indices: &HashSet<u32>,
+        species_indices: Option<&HashSet<u32>>,
     ) -> Option<RegionStats> {
         calc_alignment_block_statistics(self, species_indices, start, end)
     }
@@ -132,7 +138,7 @@ impl MafBlock {
             // Calculate and format coordinates
             let strand = if *is_reverse { "-" } else { "+" };
             let coord_label = format!(
-                "{:<9}: {:>10} {}",
+                "{:<9} {:>10} {}",
                 id.chars().take(8).collect::<String>(),
                 start_pos,
                 strand
@@ -253,17 +259,19 @@ pub fn query_alignments(
 
     let mut alignments = Vec::new();
     for (i, block) in blocks.into_iter().enumerate() {
-        println!("[block {}, score {}]", i, block.score);
+        println!("[block {} | score {}]", i, block.score);
         block.pretty_print_alignments(species_dict)?;
+        //if let Some(stats) = block.calc_stats(None, None, None) {
+        //    println!("{:}", stats);
+        //}
         alignments.push(block);
-        println!();
     }
     // Print legend
     println!("\nLegend:");
     println!("{} Match", "A".green());
     println!("{} Mismatch", "A".red());
     println!("{} Indel", "-".yellow());
-    println!("Coordinates shown as: species:start_position [strand]");
+    println!("Coordinates shown as: species start_position [strand]");
 
     info!("Query elapsed {:?}", query_time);
     Ok(alignments)
@@ -367,7 +375,7 @@ pub fn stats_command(
         // Process each block independently
         for block in blocks {
             if let Some(mut block_stats) =
-                block.calc_stats(Some(start), Some(end), &species_indices)
+                block.calc_stats(Some(start), Some(end), Some(&species_indices))
             {
                 block_stats.chrom = chrom.clone(); // Set chromosome
                 stats_writer.write_stats(&block_stats, &species_dict)?;

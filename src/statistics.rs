@@ -22,6 +22,16 @@ pub struct PairwiseStats {
     pub(crate) valid_positions: u32,
 }
 
+impl std::fmt::Display for PairwiseStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:} subs, {:} gaps in {:} positions",
+            self.substitutions, self.gaps, self.valid_positions
+        )
+    }
+}
+
 impl PairwiseStats {
     fn substitution_rate(&self) -> f64 {
         if self.valid_positions == 0 {
@@ -46,6 +56,18 @@ pub struct RegionStats {
     pub(crate) start: u32,
     pub(crate) end: u32,
     pub(crate) pairwise_stats: HashMap<(u32, u32), PairwiseStats>,
+}
+
+impl std::fmt::Display for RegionStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Region {}:{:}-{:}", self.chrom, self.start, self.end)?;
+
+        for ((sp1, sp2), stats) in &self.pairwise_stats {
+            writeln!(f, "  Species {}-{}: {}", sp1, sp2, stats)?;
+        }
+
+        Ok(())
+    }
 }
 
 pub struct AlignmentStatistics {
@@ -154,7 +176,7 @@ pub fn compare_bases(b1: u8, b2: u8) -> bool {
 
 pub fn calc_alignment_block_statistics(
     block: &MafBlock,
-    species_indices: &HashSet<u32>,
+    species_indices: Option<&HashSet<u32>>,
     region_start: Option<u32>,
     region_end: Option<u32>,
 ) -> Option<RegionStats> {
@@ -192,7 +214,10 @@ pub fn calc_alignment_block_statistics(
 
     for i in 0..block.sequences.len() {
         let seq1 = &block.sequences[i];
-        if !species_indices.contains(&seq1.species_idx) {
+        if species_indices
+            .as_ref()
+            .map_or(false, |indices| !indices.contains(&seq1.species_idx))
+        {
             continue;
         }
         // Use slice of the sequence for the region of interest
@@ -200,7 +225,10 @@ pub fn calc_alignment_block_statistics(
 
         for j in (i + 1)..block.sequences.len() {
             let seq2 = &block.sequences[j];
-            if !species_indices.contains(&seq2.species_idx) {
+            if species_indices
+                .as_ref()
+                .map_or(false, |indices| !indices.contains(&seq2.species_idx))
+            {
                 continue;
             }
             // Use slice of the sequence for the region of interest
@@ -270,7 +298,8 @@ mod tests {
     fn test_perfect_match() {
         let block = create_test_block("ATCG", "ATCG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -284,7 +313,8 @@ mod tests {
     fn test_all_mismatches() {
         let block = create_test_block("ATCG", "TAGC");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 4);
@@ -298,7 +328,8 @@ mod tests {
     fn test_single_gap() {
         let block = create_test_block("A-TCG", "AATCG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -312,7 +343,8 @@ mod tests {
     fn test_multiple_gaps() {
         let block = create_test_block("A-TC-G", "A-TC-G");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -326,7 +358,8 @@ mod tests {
     fn test_mixed_case() {
         let block = create_test_block("AtCg", "aTcG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0); // Should handle case-insensitive comparison
@@ -340,7 +373,8 @@ mod tests {
     fn test_gaps_and_mismatches() {
         let block = create_test_block("A-TCG", "AT-CG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -354,7 +388,8 @@ mod tests {
     fn test_dot_gaps() {
         let block = create_test_block("A.TCG", "AATCG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -368,7 +403,8 @@ mod tests {
     fn test_empty_sequences() {
         let block = create_test_block("", "");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = calc_alignment_block_statistics(&block, &species_indices, None, None).unwrap();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -382,7 +418,9 @@ mod tests {
     fn test_mixed_case_stats() {
         let block = create_test_block("ATCGatcg", "atcgATCG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = block.calc_stats(None, None, &species_indices).unwrap();
+        let stats = block
+            .calc_stats(None, None, Some(&species_indices))
+            .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(
@@ -396,7 +434,9 @@ mod tests {
     fn test_mixed_case_with_gaps_stats() {
         let block = create_test_block("A-ccG", "AtC-g");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = block.calc_stats(None, None, &species_indices).unwrap();
+        let stats = block
+            .calc_stats(None, None, Some(&species_indices))
+            .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(
@@ -411,7 +451,9 @@ mod tests {
     fn test_mixed_dots_and_dashes() {
         let block = create_test_block("A.TcG", "AtC-g");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
-        let stats = block.calc_stats(None, None, &species_indices).unwrap();
+        let stats = block
+            .calc_stats(None, None, Some(&species_indices))
+            .unwrap();
         dbg!(&stats);
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
