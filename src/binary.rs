@@ -13,13 +13,15 @@ use tracing::{info, trace};
 use hgindex::GenomicDataStore;
 
 use crate::io::{InputFile, MafReader, OutputFile, Strand};
-use crate::statistics::{calc_alignment_statistics, AlignmentStatistics};
+use crate::statistics::{
+    calc_alignment_statistics, calc_alignment_statistics_bytes, AlignmentStatistics,
+};
 
 // Species dictionary to avoid storing repetitive strings
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpeciesDictionary {
     // Maps species name to its index
-    species_to_index: HashMap<String, u32>,
+    pub(crate) species_to_index: HashMap<String, u32>,
     // Maps index back to species name
     index_to_species: Vec<String>,
 }
@@ -64,6 +66,88 @@ pub struct AlignedSequence {
 pub struct MafBlock {
     pub score: f32,
     pub sequences: Vec<AlignedSequence>,
+}
+
+impl MafBlock {
+    pub fn pretty_print_alignments(
+        &self,
+        species_dict: &SpeciesDictionary,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let alignments: Vec<(String, String, u32, bool)> = self
+            .sequences
+            .iter()
+            .enumerate()
+            .map(|(idx, aligned)| {
+                let label = &format!("seq_{}", idx);
+                let species_name = species_dict
+                    .get_species(aligned.species_idx)
+                    .unwrap_or(label);
+                (
+                    species_name.to_string(),
+                    aligned.text.clone(),
+                    aligned.start,
+                    aligned.strand,
+                )
+            })
+            .collect();
+
+        if alignments.is_empty() {
+            return Ok(());
+        }
+
+        // Get reference sequence (first sequence)
+        let reference = &alignments[0].1;
+
+        // Calculate the maximum identifier length for padding
+        let max_id_len = alignments
+            .iter()
+            .map(|(id, _, _, _)| id.len())
+            .max()
+            .unwrap_or(0);
+
+        // Print header with sequence positions
+        print!("{:width$} ", "", width = max_id_len + 15); // Increased padding for coordinates
+        for (i, _) in reference.chars().enumerate() {
+            if i % 10 == 0 {
+                print!("{:<10}", i);
+            }
+        }
+        println!();
+
+        // Print each sequence with color coding
+        for (id, sequence, start_pos, is_reverse) in &alignments {
+            // Calculate and format coordinates
+            let strand = if *is_reverse { "-" } else { "+" };
+            let coord_label = format!(
+                "{:<8}: {:>8} {}",
+                id.chars().take(8).collect::<String>(),
+                start_pos,
+                strand
+            );
+
+            // Print identifier and coordinates with padding
+            print!("{:width$} ", coord_label, width = max_id_len + 15);
+
+            // For the reference sequence, just print it normally
+            if id == &alignments[0].0 {
+                println!("{}", sequence);
+                continue;
+            }
+
+            // Compare with reference sequence and color-code
+            for (ref_base, query_base) in reference.chars().zip(sequence.chars()) {
+                let colored_base = match (ref_base, query_base) {
+                    (r, q) if r == q => query_base.to_string().green(),
+                    ('-', q) | (q, '-') => q.to_string().yellow(),
+                    _ => query_base.to_string().red(),
+                };
+                print!("{}", colored_base);
+            }
+            println!();
+        }
+
+        Ok(())
+    }
 }
 
 pub fn convert_to_binary(
@@ -133,86 +217,34 @@ pub fn convert_to_binary(
     Ok(())
 }
 
-/// Pretty prints multiple sequence alignments with color-coded bases
-pub fn pretty_print_alignments(
-    alignments: &[(String, String)],
-) -> Result<(), Box<dyn std::error::Error>> {
-    if alignments.is_empty() {
-        return Ok(());
-    }
-
-    // Get reference sequence (first sequence)
-    let reference = &alignments[0].1;
-
-    // Calculate the maximum identifier length for padding
-    let max_id_len = alignments.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
-
-    // Print header with sequence positions
-    print!("{:width$} ", "", width = max_id_len + 2);
-    for (i, _) in reference.chars().enumerate() {
-        if i % 10 == 0 {
-            print!("{:<10}", i);
-        }
-    }
-    println!();
-
-    // Print each sequence with color coding
-    for (id, sequence) in alignments {
-        // Print identifier with padding
-        print!("{:width$} ", id, width = max_id_len + 2);
-
-        // For the reference sequence, just print it normally
-        if id == &alignments[0].0 {
-            println!("{}", sequence);
-            continue;
-        }
-
-        // Compare with reference sequence and color-code
-        for (ref_base, query_base) in reference.chars().zip(sequence.chars()) {
-            let colored_base = match (ref_base, query_base) {
-                (r, q) if r == q => query_base.to_string().green(),
-                ('-', q) | (q, '-') => q.to_string().yellow(),
-                _ => query_base.to_string().red(),
-            };
-            print!("{}", colored_base);
-        }
-        println!();
-    }
-
-    // Print legend
-    println!("\nLegend:");
-    println!("{} Match", "A".green());
-    println!("{} Mismatch", "A".red());
-    println!("{} Indel", "-".yellow());
-
-    Ok(())
-}
-
 // Query overlapping alignments
 pub fn query_alignments(
     data_dir: &Path,
     chrom: &str,
     start: u32,
     end: u32,
-) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<MafBlock>, Box<dyn std::error::Error>> {
+    let total_time = Instant::now();
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
     let blocks = store.get_overlapping(chrom, start - 1, end);
+    let query_time = total_time.elapsed();
 
     // Use the store's metadata to get species names
     let species_dict = store.metadata().unwrap();
 
     let mut alignments = Vec::new();
     for block in blocks {
-        for meta in block.sequences.iter() {
-            if let Some(species_name) = species_dict.get_species(meta.species_idx) {
-                alignments.push((species_name.to_string(), meta.text.clone()));
-            }
-        }
+        block.pretty_print_alignments(species_dict)?;
+        alignments.push(block);
     }
+    // Print legend
+    println!("\nLegend:");
+    println!("{} Match", "A".green());
+    println!("{} Mismatch", "A".red());
+    println!("{} Indel", "-".yellow());
+    println!("Coordinates shown as: species:start_position [strand]");
 
-    // Pretty print the alignments
-    pretty_print_alignments(&alignments)?;
-
+    info!("Query elapsed {:?}", query_time);
     Ok(alignments)
 }
 
@@ -269,7 +301,7 @@ pub fn stats_command(
     let progress = ProgressBar::new(estimated_records);
     progress.set_style(ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} records ({eta})")?
-        .progress_chars("#>-"));
+        .progress_chars("=>-"));
 
     // Setup input/output
     let input_file = InputFile::new(regions);
@@ -284,46 +316,87 @@ pub fn stats_command(
         .has_headers(false)
         .from_reader(buf_reader);
 
-    // Open genomic data store
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
+    // Group regions by chromosome
+    let mut chrom_regions: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
 
-    // Get species dictionary from metadata
-    let species_dict = SpeciesDictionary::new();
-
-    // Process each region
+    // First pass: collect regions by chromosome
     for result in reader.records() {
         let record = result?;
         let chrom = record[0].to_string();
         let start: u32 = record[1].parse()?;
         let end: u32 = record[2].parse()?;
 
-        // Query overlapping alignments
-        let find_start = Instant::now();
-        let blocks = store.get_overlapping(&chrom, start - 1, end); // Convert to 0-based
-        trace!(elapsed = ?find_start.elapsed(), "Finding blocks");
+        chrom_regions.entry(chrom).or_default().push((start, end));
+    }
 
-        if !blocks.is_empty() {
-            // Convert blocks to alignments with proper species names
-            let alignments: Vec<(String, String)> = blocks
-                .into_iter()
+    // Sort regions within each chromosome
+    for regions in chrom_regions.values_mut() {
+        regions.sort_by_key(|&(start, _)| start);
+    }
+
+    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
+    let species_dict = store
+        .metadata()
+        .expect("Missing species dictionary")
+        .clone();
+
+    // Convert species names to indices up front
+    let species_indices: HashSet<u32> = species
+        .iter()
+        .filter_map(|name| species_dict.species_to_index.get(name).copied())
+        .collect();
+
+    // Process each chromosome's regions
+    for (chrom, regions) in chrom_regions {
+        // Open chromosome file once
+        if let Err(_) = store.open_chrom_file(&chrom) {
+            continue;
+        }
+
+        // Keep track of current blocks
+        let mut current_blocks: Vec<MafBlock> = Vec::new();
+
+        for &(start, end) in &regions {
+            // Remove blocks that can't overlap anymore
+            current_blocks.retain(|block| {
+                let block_end = block.sequences[0].start + block.sequences[0].size;
+                block_end >= start
+            });
+
+            // Only fetch new blocks if needed
+            if current_blocks.is_empty() || current_blocks.last().unwrap().sequences[0].start < end
+            {
+                let new_blocks = store.get_overlapping(&chrom, start, end);
+                current_blocks.extend(new_blocks);
+            }
+
+            // Process current region with available blocks
+            let alignments: Vec<(u32, String)> = current_blocks
+                .iter()
+                .filter(|block| {
+                    let block_start = block.sequences[0].start;
+                    let block_end = block_start + block.sequences[0].size;
+                    block_start <= end && block_end >= start
+                })
                 .flat_map(|block| {
                     block
                         .sequences
                         .iter()
-                        .filter_map(|aligned| {
-                            // Get species name from dictionary
-                            species_dict
-                                .get_species(aligned.species_idx)
-                                .map(|species| (species.to_string(), aligned.text.clone()))
-                        })
-                        .collect::<Vec<_>>()
+                        .map(|aligned| (aligned.species_idx, aligned.text.clone()))
                 })
                 .collect();
 
-            let region_stats = calc_alignment_statistics(alignments, &species, chrom, start, end);
-            stats_writer.write_stats(&region_stats)?;
+            let region_stats = calc_alignment_statistics_bytes(
+                alignments,
+                &species_indices,
+                chrom.clone(),
+                start,
+                end,
+            );
+
+            stats_writer.write_stats(&region_stats, &species_dict)?;
+            progress.inc(1);
         }
-        progress.inc(1);
     }
 
     progress.finish_with_message("Processing complete");
