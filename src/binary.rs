@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufRead;
+use std::path::PathBuf;
 use std::time::Instant;
 use std::{collections::HashSet, path::Path};
-use tracing::info;
+use tracing::{info, warn};
 
 use hgindex::GenomicDataStore;
 
@@ -309,6 +310,7 @@ pub fn query_alignments(
 }
 
 pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary, color: bool) {
+    let has_blocks = !blocks.is_empty();
     for (i, block) in blocks.into_iter().enumerate() {
         println!("[block {} | score {}]", i, block.score);
         block.pretty_print_alignments(species_dict, color);
@@ -316,12 +318,14 @@ pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary,
         //    println!("{:}", stats);
         //}
     }
-    // Print legend
-    println!("\nLegend:");
-    println!("{} Match", "A".green());
-    println!("{} Mismatch", "A".red());
-    println!("{} Indel", "-".yellow());
-    println!("Coordinates shown as: species start_position [strand]");
+    if has_blocks {
+        // Print legend
+        println!("\nLegend:");
+        println!("{} Match", "A".green());
+        println!("{} Mismatch", "A".red());
+        println!("{} Indel", "-".yellow());
+        println!("Coordinates shown as: species start_position [strand]");
+    }
 }
 
 /// Estimates number of records in a TSV/CSV file
@@ -433,6 +437,106 @@ pub fn stats_command(
     }
 
     progress.finish_with_message("Processing complete");
+    info!("Total elapsed {:?}", total_time.elapsed());
+    Ok(())
+}
+
+use glob::glob;
+use std::error::Error;
+
+pub fn convert_to_binary_glob(
+    input_pattern: &str,
+    output_dir: &Path,
+    min_length: u64,
+) -> Result<(), Box<dyn Error>> {
+    let total_time = Instant::now();
+
+    // Create progress bar
+    let style = ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({msg})")?
+        .progress_chars("=>-");
+
+    // Collect all matching files
+    let mut input_files: Vec<PathBuf> = glob(input_pattern)?.filter_map(Result::ok).collect();
+
+    if input_files.is_empty() {
+        warn!("No files found matching pattern: {}", input_pattern);
+        return Ok(());
+    }
+
+    info!("Found {} files to process", input_files.len());
+    input_files.sort(); // Sort for consistent processing
+
+    // Create store with species dictionary
+    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::create(output_dir, None)?;
+    store.set_metadata(SpeciesDictionary::new());
+
+    // Setup progress bar
+    let progress = ProgressBar::new(input_files.len() as u64);
+    progress.set_style(style);
+
+    // Process each file
+    for input_file in input_files {
+        let file_name = input_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        progress.set_message(format!("Processing {}", file_name));
+
+        let mut maf = MafReader::from_file(&input_file)?;
+        let _header = maf.read_header()?;
+
+        while let Some(block) = maf.next_block()? {
+            if block.sequences[0].size < min_length {
+                continue;
+            }
+
+            let ref_seq = &block.sequences[0];
+            let chr = ref_seq.src.split('.').nth(1).ok_or("Invalid ref name")?;
+
+            // Convert sequences to metadata + alignment strings
+            let mut alignment_strings = Vec::new();
+
+            for seq in &block.sequences {
+                let species = seq.src.split('.').next().unwrap_or("unknown").to_string();
+
+                // Get mutable reference to metadata and update species dictionary
+                let species_idx = if let Some(metadata) = store.metadata_mut() {
+                    metadata.get_or_insert(species)
+                } else {
+                    return Err("Missing metadata".into());
+                };
+
+                alignment_strings.push(AlignedSequence {
+                    species_idx,
+                    start: seq.start as u32,
+                    size: seq.size as u32,
+                    strand: matches!(seq.strand, Strand::Reverse),
+                    src_size: seq.src_size as u32,
+                    text: seq.text.clone(),
+                });
+            }
+
+            let score = block.score.unwrap_or(0.0) as f32;
+            let record = MafBlock {
+                score,
+                sequences: alignment_strings,
+            };
+
+            store.add_record(
+                chr,
+                ref_seq.start as u32,
+                (ref_seq.start + ref_seq.size) as u32,
+                &record,
+            )?;
+        }
+        progress.inc(1);
+    }
+
+    // Finalize and clean up
+    progress.finish_with_message("Processing complete");
+    store.finalize()?;
+
     info!("Total elapsed {:?}", total_time.elapsed());
     Ok(())
 }

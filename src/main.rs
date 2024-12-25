@@ -1,7 +1,9 @@
 // main.rs
 use clap::Parser;
 use hgindex::BinningIndex;
-use maftk::binary::{convert_to_binary, print_alignments, query_alignments};
+use maftk::binary::{
+    convert_to_binary, convert_to_binary_glob, print_alignments, query_alignments,
+};
 use maftk::binary::{stats_command, SpeciesDictionary};
 use maftk::io::MafReader;
 use std::collections::HashSet;
@@ -40,9 +42,10 @@ enum Commands {
     },
     /// Convert MAF to binary format with index
     Binary {
-        /// Input MAF file
+        /// Input MAF file, or multiple MAF files with glob (e.g. "mafs/chr*.maf")
+        /// Files can be gzipped.
         #[arg(value_name = "input.maf")]
-        input: PathBuf,
+        input: String,
 
         /// Output directory
         #[arg(short, long, default_value = "maf.mmdb")]
@@ -290,7 +293,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_dir,
             min_length,
         } => {
-            convert_to_binary(&input, &output_dir, min_length)?;
+            if input.contains('*') || input.contains('?') {
+                // Use glob version for wildcard patterns
+                convert_to_binary_glob(&input, &output_dir, min_length)?;
+            } else {
+                // Use original version for single files
+                convert_to_binary(&Path::new(&input), &output_dir, min_length)?;
+            }
         }
         Commands::Split {
             input,
