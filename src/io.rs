@@ -27,6 +27,7 @@ pub struct MafHeader {
 }
 
 /// Represents a sequence within an alignment block
+// TODO: this is redundant with AlignedSequence!
 #[derive(Debug, Clone)]
 pub struct Sequence {
     /// Source sequence name (e.g. the species' genome version)
