@@ -83,10 +83,7 @@ impl MafBlock {
     ) -> Option<RegionStats> {
         calc_alignment_block_statistics(self, species_indices, start, end)
     }
-    pub fn pretty_print_alignments(
-        &self,
-        species_dict: &SpeciesDictionary,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn pretty_print_alignments(&self, species_dict: &SpeciesDictionary, color: bool) {
         let alignments: Vec<(String, String, u32, bool)> = self
             .sequences
             .iter()
@@ -110,7 +107,7 @@ impl MafBlock {
             .collect();
 
         if alignments.is_empty() {
-            return Ok(());
+            return;
         }
 
         // Get reference sequence (first sequence)
@@ -133,13 +130,13 @@ impl MafBlock {
         }
         println!();
 
-        // Print each sequence with color coding
+        // Print each sequence with optional color coding
         for (id, sequence, start_pos, is_reverse) in &alignments {
             // Calculate and format coordinates
             let strand = if *is_reverse { "-" } else { "+" };
             let coord_label = format!(
-                "{:<9} {:>10} {}",
-                id.chars().take(8).collect::<String>(),
+                "{:<10} {:>10} {}",
+                id.chars().collect::<String>(),
                 start_pos,
                 strand
             );
@@ -153,23 +150,68 @@ impl MafBlock {
                 continue;
             }
 
-            // Compare with reference sequence and color-code
-            for (ref_byte, query_byte) in
-                reference.as_bytes().iter().zip(sequence.as_bytes().iter())
-            {
-                let colored_base = if is_gap(*ref_byte) && is_gap(*query_byte) {
-                    (*query_byte as char).to_string().green()
-                } else if is_gap(*ref_byte) || is_gap(*query_byte) {
-                    (*query_byte as char).to_string().yellow()
-                } else if compare_bases(*ref_byte, *query_byte) {
-                    (*query_byte as char).to_string().green()
-                } else {
-                    (*query_byte as char).to_string().red()
-                };
-                print!("{}", colored_base);
+            if color {
+                // Compare with reference sequence and color-code
+                for (ref_byte, query_byte) in
+                    reference.as_bytes().iter().zip(sequence.as_bytes().iter())
+                {
+                    let colored_base = if is_gap(*ref_byte) && is_gap(*query_byte) {
+                        (*query_byte as char).to_string().green()
+                    } else if is_gap(*ref_byte) || is_gap(*query_byte) {
+                        (*query_byte as char).to_string().yellow()
+                    } else if compare_bases(*ref_byte, *query_byte) {
+                        (*query_byte as char).to_string().green()
+                    } else {
+                        (*query_byte as char).to_string().red()
+                    };
+                    print!("{}", colored_base);
+                }
+            } else {
+                print!("{}", sequence);
             }
             println!();
         }
+    }
+
+    pub fn format_fasta(&self, species_dict: &SpeciesDictionary, chrom: &str) -> String {
+        // Map each sequence to its FASTA format and collect into a vector
+        let fasta_entries: Vec<String> = self
+            .sequences
+            .iter()
+            .map(|seq| {
+                let species = species_dict
+                    .get_species(seq.species_idx)
+                    .unwrap_or("unknown");
+                // Include chromosome, strand information and coordinates
+                let strand = if seq.strand { "-" } else { "+" };
+                format!(
+                    ">{}.{} {}:{}-{} {}\n{}",
+                    species,
+                    chrom,
+                    chrom,
+                    seq.start,
+                    seq.start + seq.size,
+                    strand,
+                    seq.text
+                )
+            })
+            .collect();
+
+        // Join all entries with newlines
+        fasta_entries.join("\n") + "\n"
+    }
+
+    /// Write the alignment blocks to a FASTA file.
+    pub fn write_fasta(
+        &self,
+        path: &Path,
+        species_dict: &SpeciesDictionary,
+        chrom: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = OutputFile::new(path).writer()?;
+
+        // Write the formatted FASTA string to the file
+        writeln!(writer, "{}", self.format_fasta(species_dict, chrom))?;
 
         Ok(())
     }
@@ -248,7 +290,7 @@ pub fn query_alignments(
     chrom: &str,
     start: u32,
     end: u32,
-) -> Result<Vec<MafBlock>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<MafBlock>, SpeciesDictionary), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
     let blocks: Vec<MafBlock> = store.get_overlapping(chrom, start - 1, end);
@@ -257,14 +299,22 @@ pub fn query_alignments(
     // Use the store's metadata to get species names
     let species_dict = store.metadata().unwrap();
 
-    let mut alignments = Vec::new();
+    info!(
+        "Query elapsed {:?}, {} overlapping alignment block{} found.",
+        query_time,
+        blocks.len(),
+        if blocks.len() > 1 { "s" } else { "" }
+    );
+    Ok((blocks, species_dict.clone()))
+}
+
+pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary, color: bool) {
     for (i, block) in blocks.into_iter().enumerate() {
         println!("[block {} | score {}]", i, block.score);
-        block.pretty_print_alignments(species_dict)?;
+        block.pretty_print_alignments(species_dict, color);
         //if let Some(stats) = block.calc_stats(None, None, None) {
         //    println!("{:}", stats);
         //}
-        alignments.push(block);
     }
     // Print legend
     println!("\nLegend:");
@@ -272,9 +322,6 @@ pub fn query_alignments(
     println!("{} Mismatch", "A".red());
     println!("{} Indel", "-".yellow());
     println!("Coordinates shown as: species start_position [strand]");
-
-    info!("Query elapsed {:?}", query_time);
-    Ok(alignments)
 }
 
 /// Estimates number of records in a TSV/CSV file

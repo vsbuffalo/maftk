@@ -1,9 +1,9 @@
 // main.rs
-use biomaf::binary::{convert_to_binary, query_alignments};
-use biomaf::binary::{stats_command, SpeciesDictionary};
-use biomaf::io::MafReader;
 use clap::Parser;
 use hgindex::BinningIndex;
+use maftk::binary::{convert_to_binary, print_alignments, query_alignments};
+use maftk::binary::{stats_command, SpeciesDictionary};
+use maftk::io::MafReader;
 use std::collections::HashSet;
 use std::fs::create_dir_all;
 use std::fs::File;
@@ -38,7 +38,7 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         min_length: u64,
     },
-    /// Convert MAF to binary 3-bit format with index
+    /// Convert MAF to binary format with index
     Binary {
         /// Input MAF file
         #[arg(value_name = "input.maf")]
@@ -52,7 +52,8 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         min_length: u64,
     },
-    /// Get alignments at a specific position or range
+    /// Get alignments at a specific position or range, and either write to a directory (one FASTA
+    /// file per alignment) or print alignments.
     Query {
         /// Chromosome name (e.g., chr22)
         #[arg(value_name = "chromosome")]
@@ -69,6 +70,15 @@ enum Commands {
         /// Directory containing binary MAF files
         #[arg(short, long, default_value = "maf.mmdb")]
         data_dir: PathBuf,
+
+        /// Optional directory to output FASTA files for all overlapping alignment regions.
+        /// If not specified
+        #[arg(short, long)]
+        fasta_dir: Option<PathBuf>,
+
+        /// Don't color
+        #[arg(short, long)]
+        no_color: bool,
     },
     /// Calculate an alignment statistics table for all alignments
     /// in the supplied BED file.
@@ -98,7 +108,7 @@ enum Commands {
     },
 }
 
-fn write_maf_header(file: &mut File, header: &biomaf::io::MafHeader) -> std::io::Result<()> {
+fn write_maf_header(file: &mut File, header: &maftk::io::MafHeader) -> std::io::Result<()> {
     write!(file, "##maf version={}", header.version)?;
     if let Some(scoring) = &header.scoring {
         write!(file, " scoring={}", scoring)?;
@@ -110,7 +120,7 @@ fn write_maf_header(file: &mut File, header: &biomaf::io::MafHeader) -> std::io:
     writeln!(file) // Extra newline after header
 }
 
-fn write_block(file: &mut File, block: &biomaf::io::AlignmentBlock) -> std::io::Result<()> {
+fn write_block(file: &mut File, block: &maftk::io::AlignmentBlock) -> std::io::Result<()> {
     // Write alignment line
     write!(file, "a")?;
     if let Some(score) = block.score {
@@ -129,7 +139,7 @@ fn write_block(file: &mut File, block: &biomaf::io::AlignmentBlock) -> std::io::
             seq.src,
             seq.start,
             seq.size,
-            if seq.strand == biomaf::io::Strand::Forward {
+            if seq.strand == maftk::io::Strand::Forward {
                 "+"
             } else {
                 "-"
@@ -146,21 +156,21 @@ fn write_block(file: &mut File, block: &biomaf::io::AlignmentBlock) -> std::io::
             "i {} {} {} {} {}",
             info.src,
             match info.left_status {
-                biomaf::io::StatusChar::Contiguous => "C",
-                biomaf::io::StatusChar::Intervening => "I",
-                biomaf::io::StatusChar::New => "N",
-                biomaf::io::StatusChar::NewBridged => "n",
-                biomaf::io::StatusChar::Missing => "M",
-                biomaf::io::StatusChar::Tandem => "T",
+                maftk::io::StatusChar::Contiguous => "C",
+                maftk::io::StatusChar::Intervening => "I",
+                maftk::io::StatusChar::New => "N",
+                maftk::io::StatusChar::NewBridged => "n",
+                maftk::io::StatusChar::Missing => "M",
+                maftk::io::StatusChar::Tandem => "T",
             },
             info.left_count,
             match info.right_status {
-                biomaf::io::StatusChar::Contiguous => "C",
-                biomaf::io::StatusChar::Intervening => "I",
-                biomaf::io::StatusChar::New => "N",
-                biomaf::io::StatusChar::NewBridged => "n",
-                biomaf::io::StatusChar::Missing => "M",
-                biomaf::io::StatusChar::Tandem => "T",
+                maftk::io::StatusChar::Contiguous => "C",
+                maftk::io::StatusChar::Intervening => "I",
+                maftk::io::StatusChar::New => "N",
+                maftk::io::StatusChar::NewBridged => "n",
+                maftk::io::StatusChar::Missing => "M",
+                maftk::io::StatusChar::Tandem => "T",
             },
             info.right_count,
         )?;
@@ -169,7 +179,7 @@ fn write_block(file: &mut File, block: &biomaf::io::AlignmentBlock) -> std::io::
     writeln!(file) // Extra newline between blocks
 }
 
-fn get_block_range(block: &biomaf::io::AlignmentBlock) -> Option<(String, u64, u64)> {
+fn get_block_range(block: &maftk::io::AlignmentBlock) -> Option<(String, u64, u64)> {
     // Get the first sequence in the block
     let first_seq = block.sequences.first()?;
 
@@ -269,7 +279,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Initialize logger with default level INFO
-    tracing_subscriber::fmt().with_max_level(level).init();
+    tracing_subscriber::fmt()
+        .without_time()
+        .with_max_level(level)
+        .init();
 
     match cli.command {
         Commands::Binary {
@@ -301,13 +314,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             start,
             end,
             data_dir,
+            fasta_dir,
+            no_color,
         } => {
             let end = end.unwrap_or(start + 1);
             if end <= start {
                 eprintln!("End position must be greater than start position");
                 std::process::exit(1);
             }
-            query_alignments(&data_dir, &chromosome, start, end)?;
+
+            // Get the overlapping alignment blocks
+            let (blocks, species_dict) = query_alignments(&data_dir, &chromosome, start, end)?;
+
+            if let Some(dir) = fasta_dir {
+                create_dir_all(&dir)?;
+                for (i, block) in blocks.iter().enumerate() {
+                    let filepath = format!("block_{}.fa.gz", i);
+                    let path = dir.join(&filepath);
+                    block.write_fasta(&path, &species_dict, &chromosome)?;
+                }
+            } else {
+                // We print to screen rather than write to FASTA directory.
+                print_alignments(blocks, &species_dict, !no_color);
+            };
         }
         Commands::Stats {
             regions,

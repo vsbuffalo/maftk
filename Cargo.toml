@@ -1,5 +1,5 @@
 [package]
-name = "biomaf"
+name = "maftk"
 version = "0.1.0"
 edition = "2021"
 
@@ -21,11 +21,11 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 
 [lib]
-name = "biomaf"
+name = "maftk"
 path = "src/lib.rs"
 
 [[bin]]
-name = "biomaf"
+name = "maftk"
 path = "src/main.rs"
 
 [dev-dependencies]

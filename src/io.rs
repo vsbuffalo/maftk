@@ -347,7 +347,7 @@ impl OutputFile {
     pub fn writer(&self) -> Result<Box<dyn Write>, Error> {
         let outfile = &self.filepath;
         let is_gzip = outfile.ends_with(".gz");
-        let bed_writer: Box<dyn Write> = if is_gzip {
+        let writer: Box<dyn Write> = if is_gzip {
             Box::new(BufWriter::new(GzEncoder::new(
                 File::create(outfile)?,
                 Compression::default(),
@@ -355,7 +355,7 @@ impl OutputFile {
         } else {
             Box::new(BufWriter::new(File::create(outfile)?))
         };
-        Ok(bed_writer)
+        Ok(writer)
     }
 }
 
