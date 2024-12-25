@@ -157,21 +157,17 @@ impl AlignmentStatistics {
     }
 }
 
-pub fn is_gap(b: u8) -> bool {
-    b == b'-' || b == b'.'
+use bio_seq::prelude::*;
+
+pub fn is_gap(base: Iupac) -> bool {
+    base == Iupac::X // X is used for gaps in bio-seq
 }
 
-pub fn compare_bases(b1: u8, b2: u8) -> bool {
-    // First check if either is a gap
+pub fn compare_bases(b1: Iupac, b2: Iupac) -> bool {
     if is_gap(b1) || is_gap(b2) {
-        return false; // gaps are handled separately
+        return false;
     }
-
-    // Convert both to uppercase for comparison
-    let b1_upper = b1.to_ascii_uppercase();
-    let b2_upper = b2.to_ascii_uppercase();
-
-    b1_upper == b2_upper
+    b1 == b2
 }
 
 pub fn calc_alignment_block_statistics(
@@ -184,24 +180,17 @@ pub fn calc_alignment_block_statistics(
     let block_start = ref_seq.start;
     let block_end = block_start + ref_seq.size;
 
-    // If region is specified, calculate overlap
     let (start_offset, length) = if let (Some(start), Some(end)) = (region_start, region_end) {
-        // Check if there's any overlap
         if end <= block_start || start >= block_end {
             return None;
         }
-
-        // Calculate overlap region
         let overlap_start = start.max(block_start);
         let overlap_end = end.min(block_end);
-
-        // Calculate offset and length
         (
             (overlap_start - block_start) as usize,
             (overlap_end - overlap_start) as usize,
         )
     } else {
-        // Use full sequence if no region specified
         (0, ref_seq.size as usize)
     };
 
@@ -220,8 +209,15 @@ pub fn calc_alignment_block_statistics(
         {
             continue;
         }
-        // Use slice of the sequence for the region of interest
-        let seq1_bytes = &seq1.text.as_bytes()[start_offset..start_offset + length];
+
+        // Convert to vector so we can iterate multiple times
+        let seq1_bases: Vec<Iupac> = seq1
+            .text
+            .as_ref()
+            .iter()
+            .skip(start_offset)
+            .take(length)
+            .collect();
 
         for j in (i + 1)..block.sequences.len() {
             let seq2 = &block.sequences[j];
@@ -231,18 +227,23 @@ pub fn calc_alignment_block_statistics(
             {
                 continue;
             }
-            // Use slice of the sequence for the region of interest
-            let seq2_bytes = &seq2.text.as_bytes()[start_offset..start_offset + length];
+
+            let seq2_bases: Vec<Iupac> = seq2
+                .text
+                .as_ref()
+                .iter()
+                .skip(start_offset)
+                .take(length)
+                .collect();
 
             let mut pair_stats = PairwiseStats::default();
 
-            for (b1, b2) in seq1_bytes.iter().zip(seq2_bytes.iter()) {
+            for (b1, b2) in seq1_bases.iter().zip(seq2_bases.iter()) {
                 if is_gap(*b1) && is_gap(*b2) {
                     continue; // Matching gaps
                 } else if is_gap(*b1) || is_gap(*b2) {
                     pair_stats.gaps += 1; // One gap
                 } else {
-                    // Both are bases
                     pair_stats.valid_positions += 1;
                     if !compare_bases(*b1, *b2) {
                         pair_stats.substitutions += 1;
@@ -264,13 +265,15 @@ pub fn calc_alignment_block_statistics(
 
 #[cfg(test)]
 mod tests {
-    use crate::binary::AlignedSequence;
+    use crate::{binary::AlignedSequence, io::standardize_to_iupac};
 
     use super::*;
     use std::collections::HashSet;
 
     // Helper function to create a MafBlock with two sequences
     fn create_test_block(seq1: &str, seq2: &str) -> MafBlock {
+        let seq1 = standardize_to_iupac(seq1).unwrap();
+        let seq2 = standardize_to_iupac(seq2).unwrap();
         MafBlock {
             score: 0.0,
             sequences: vec![
@@ -280,7 +283,7 @@ mod tests {
                     size: seq1.len() as u32,
                     strand: false,
                     src_size: seq1.len() as u32,
-                    text: seq1.to_string(),
+                    text: seq1.try_into().expect("Invalid IUPAC sequence"),
                 },
                 AlignedSequence {
                     species_idx: 1,
@@ -288,7 +291,7 @@ mod tests {
                     size: seq2.len() as u32,
                     strand: false,
                     src_size: seq2.len() as u32,
-                    text: seq2.to_string(),
+                    text: seq2.try_into().expect("Invalid IUPAC sequence"),
                 },
             ],
         }

@@ -1,9 +1,14 @@
 // binary.rs
+use bio_seq::codec::iupac::Iupac;
+use bio_seq::error::ParseBioError;
+use bio_seq::seq::Seq;
 use colored::*;
 use csv::ReaderBuilder;
+use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::error::Error;
 use std::fs::File;
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -65,7 +70,7 @@ pub struct AlignedSequence {
     pub size: u32,        // Size of aligning region
     pub strand: bool,     // false for forward (+), true for reverse (-)
     pub src_size: u32,    // Total size of source sequence
-    pub text: String,     // Raw sequence
+    pub text: Seq<Iupac>, // Raw sequence
 }
 
 // Modified MafBlock to include metadata
@@ -84,6 +89,8 @@ impl MafBlock {
     ) -> Option<RegionStats> {
         calc_alignment_block_statistics(self, species_indices, start, end)
     }
+    // In binary.rs modify the pretty_print_alignments method:
+
     pub fn pretty_print_alignments(&self, species_dict: &SpeciesDictionary, color: bool) {
         let alignments: Vec<(String, String, u32, bool)> = self
             .sequences
@@ -95,13 +102,9 @@ impl MafBlock {
                     .get_species(aligned.species_idx)
                     .unwrap_or(label);
                 (
-                    // species name
                     species_name.to_string(),
-                    // aligned sequence
-                    aligned.text.clone(),
-                    // start position
+                    aligned.text.to_string(), // Convert Seq<Iupac> to String for display
                     aligned.start,
-                    // end position
                     aligned.strand,
                 )
             })
@@ -111,19 +114,19 @@ impl MafBlock {
             return;
         }
 
-        // Get reference sequence (first sequence)
+        // Get reference sequence
         let ref_alignment = &alignments[0];
         let reference = &ref_alignment.1;
 
-        // Calculate the maximum identifier length for padding
+        // Calculate max identifier length
         let max_id_len = alignments
             .iter()
             .map(|(id, _, _, _)| id.len())
             .max()
             .unwrap_or(0);
 
-        // Print header with sequence positions
-        print!("{:width$} ", "", width = max_id_len + 15); // Increased padding for coordinates
+        // Print header with positions
+        print!("{:width$} ", "", width = max_id_len + 15);
         for (i, _) in reference.chars().enumerate() {
             if i % 10 == 0 {
                 print!("{:<10}", i);
@@ -131,9 +134,7 @@ impl MafBlock {
         }
         println!();
 
-        // Print each sequence with optional color coding
         for (id, sequence, start_pos, is_reverse) in &alignments {
-            // Calculate and format coordinates
             let strand = if *is_reverse { "-" } else { "+" };
             let coord_label = format!(
                 "{:<10} {:>10} {}",
@@ -142,7 +143,6 @@ impl MafBlock {
                 strand
             );
 
-            // Print identifier and coordinates with padding
             print!("{:width$} ", coord_label, width = max_id_len + 15);
 
             // For the reference sequence, just print it normally
@@ -153,27 +153,24 @@ impl MafBlock {
 
             if color {
                 // Compare with reference sequence and color-code
-                for (ref_byte, query_byte) in
-                    reference.as_bytes().iter().zip(sequence.as_bytes().iter())
-                {
-                    let colored_base = if is_gap(*ref_byte) && is_gap(*query_byte) {
-                        (*query_byte as char).to_string().green()
-                    } else if is_gap(*ref_byte) || is_gap(*query_byte) {
-                        (*query_byte as char).to_string().yellow()
-                    } else if compare_bases(*ref_byte, *query_byte) {
-                        (*query_byte as char).to_string().green()
+                for (ref_char, query_char) in reference.chars().zip(sequence.chars()) {
+                    let colored_base = if ref_char == '-' && query_char == '-' {
+                        query_char.to_string().green()
+                    } else if ref_char == '-' || query_char == '-' {
+                        query_char.to_string().yellow()
+                    } else if ref_char.to_ascii_uppercase() == query_char.to_ascii_uppercase() {
+                        query_char.to_string().green()
                     } else {
-                        (*query_byte as char).to_string().red()
+                        query_char.to_string().red()
                     };
                     print!("{}", colored_base);
                 }
+                println!();
             } else {
-                print!("{}", sequence);
+                println!("{}", sequence);
             }
-            println!();
         }
     }
-
     pub fn format_fasta(&self, species_dict: &SpeciesDictionary, chrom: &str) -> String {
         // Map each sequence to its FASTA format and collect into a vector
         let fasta_entries: Vec<String> = self
@@ -218,6 +215,24 @@ impl MafBlock {
     }
 }
 
+/// Standardizes a sequence string to IUPAC format and returns a Seq<Iupac>
+/// - Converts lowercase to uppercase
+/// - Converts '.' to '-' for gaps
+/// - Replaces '-' with 'X' for bio-seq IUPAC gap representation
+pub fn standardize_to_iupac(seq: &str) -> Result<Seq<Iupac>, ParseBioError> {
+    // First convert to uppercase and standardize gaps
+    let standardized: String = seq
+        .chars()
+        .map(|c| match c {
+            '.' | '-' => 'X', // Convert both . and - to X for bio-seq IUPAC
+            c => c.to_ascii_uppercase(),
+        })
+        .collect();
+
+    // Now convert to IUPAC sequence
+    standardized.try_into()
+}
+
 pub fn convert_to_binary(
     input: &Path,
     output_dir: &Path,
@@ -259,7 +274,11 @@ pub fn convert_to_binary(
                 size: seq.size as u32,
                 strand: matches!(seq.strand, Strand::Reverse),
                 src_size: seq.src_size as u32,
-                text: seq.text.clone(),
+                text: seq
+                    .text
+                    .clone()
+                    .try_into()
+                    .expect("Invalid IUPAC sequence."),
             });
         }
 
@@ -441,9 +460,6 @@ pub fn stats_command(
     Ok(())
 }
 
-use glob::glob;
-use std::error::Error;
-
 pub fn convert_to_binary_glob(
     input_pattern: &str,
     output_dir: &Path,
@@ -513,7 +529,11 @@ pub fn convert_to_binary_glob(
                     size: seq.size as u32,
                     strand: matches!(seq.strand, Strand::Reverse),
                     src_size: seq.src_size as u32,
-                    text: seq.text.clone(),
+                    text: seq
+                        .text
+                        .clone()
+                        .try_into()
+                        .expect("Invalid IUPAC sequence."),
                 });
             }
 

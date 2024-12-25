@@ -1,4 +1,5 @@
 /// io.rs
+use bio_seq::prelude::*;
 use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -16,6 +17,8 @@ pub enum MafError {
     ParseError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("Sequence error: {0}")]
+    SequenceError(#[from] ParseBioError),
 }
 
 /// Represents a MAF file header
@@ -40,7 +43,7 @@ pub struct Sequence {
     /// total size of source sequence
     pub src_size: u64,
     /// alignment text including gaps
-    pub text: String,
+    pub text: Seq<Iupac>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,6 +112,23 @@ pub fn get_reader(filepath: &Path) -> io::Result<Box<dyn BufRead>> {
     } else {
         Ok(Box::new(BufReader::new(file)))
     }
+}
+
+/// Standardizes a sequence string to IUPAC format and returns a Seq<Iupac>
+/// - Converts lowercase to uppercase
+/// - Converts '.' and '-' to 'X' for bio-seq IUPAC gaps
+pub fn standardize_to_iupac(seq: &str) -> Result<Seq<Iupac>, ParseBioError> {
+    // First standardize to a clean string of valid IUPAC codes
+    let normalized: String = seq
+        .chars()
+        .map(|c| match c {
+            '.' | '-' => '-', // Keep as dash for now
+            c => c.to_ascii_uppercase(),
+        })
+        .collect();
+
+    // Now do the bio-seq conversion which will handle the dashes
+    normalized.try_into()
 }
 
 pub type BoxedReader = Box<dyn BufRead>;
@@ -238,7 +258,7 @@ impl MafReader {
                         src_size: parts[4]
                             .parse()
                             .map_err(|_| MafError::ParseError("Invalid source size".to_string()))?,
-                        text: parts[5].to_string(),
+                        text: standardize_to_iupac(parts[5])?,
                     });
                 }
                 "i" => {
@@ -404,11 +424,11 @@ mod tests {
         let hg38 = &block.sequences[0].text;
         let pantro4 = &block.sequences[1].text;
 
-        assert!(hg38.contains("----")); // Check for gap presence
-        assert!(pantro4.contains("----"));
+        assert!(hg38.to_string().contains("----")); // Check for gap presence
+        assert!(pantro4.to_string().contains("----"));
 
         // Verify specific gap in panTro4 sequence (the single base deletion)
-        assert!(pantro4.contains("TTTTCAA-GC"));
+        assert!(pantro4.to_string().contains("TTTTCAA-GC"));
     }
 
     #[test]
@@ -436,7 +456,7 @@ mod tests {
         assert_eq!(hg38.size, 138);
         assert_eq!(hg38.strand, Strand::Forward);
         assert_eq!(hg38.src_size, 50818468);
-        assert!(hg38.text.starts_with("TTTTCAAAGC"));
+        assert!(hg38.text.to_string().starts_with("TTTTCAAAGC"));
 
         // Test specific sequences from different parts of the alignment
         let check_species = vec![
@@ -472,7 +492,7 @@ mod tests {
             .iter()
             .find(|s| s.src == "panTro4.chrUn_GL393523")
             .unwrap();
-        assert!(pantro4.text.contains("TTTTCAA-GC"));
+        assert!(pantro4.text.to_string().contains("TTTTCAA-GC"));
 
         // Test info line for a sequence with non-zero counts
         let equcab_info = block
