@@ -19,35 +19,56 @@ pub enum StatsError {
 #[derive(Clone, Default, Debug)]
 pub struct PairwiseStats {
     pub substitutions: u32,
-    pub gaps: u32,
-    pub valid_positions: u32,
+    pub matches: u32,
+    pub single_gaps: u32,
+    pub double_gaps: u32,
+    pub total_positions: u32,
 }
 
 impl std::fmt::Display for PairwiseStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:} subs, {:} gaps in {:} positions",
-            self.substitutions, self.gaps, self.valid_positions
+            "{:} subs, {:} single gaps, {:} double gaps in {:} positions",
+            self.substitutions, self.single_gaps, self.double_gaps, self.total_positions
         )
     }
 }
 
 impl PairwiseStats {
+    /// Get number of positions with bases in both sequences.
+    /// This ignores gaps; it is used as the denominator for the substitution
+    /// rate.
+    pub fn valid_positions(&self) -> u32 {
+        self.matches + self.substitutions
+    }
+
+    /// Calculate the substitution rate, as substitutions / valid positions.
+    /// Gaps (single and double) are ignored.
     pub fn substitution_rate(&self) -> f64 {
-        if self.valid_positions == 0 {
+        let valid = self.valid_positions();
+        if valid == 0 {
             0.0
         } else {
-            self.substitutions as f64 / self.valid_positions as f64
+            self.substitutions as f64 / valid as f64
         }
     }
 
+    /// Calculate the single gap rate.
     pub fn gap_rate(&self) -> f64 {
-        if self.valid_positions == 0 && self.gaps == 0 {
+        if self.total_positions == 0 {
             0.0
         } else {
-            self.gaps as f64 / (self.valid_positions + self.gaps) as f64
+            let denom = self.total_positions as f64 - self.double_gaps as f64;
+            self.single_gaps as f64 / denom
         }
+    }
+
+    pub fn check_valid(&self) {
+        assert_eq!(
+            self.total_positions,
+            self.single_gaps + self.double_gaps + self.matches + self.substitutions
+        );
     }
 }
 
@@ -88,8 +109,13 @@ impl AlignmentStatistics {
     }
 
     fn write_header(&mut self) -> Result<(), StatsError> {
-        let mut headers: Vec<String> =
-            vec!["chrom".to_string(), "start".to_string(), "end".to_string()];
+        let mut headers: Vec<String> = vec![
+            "chrom".to_string(),
+            "start".to_string(),
+            "end".to_string(),
+            "ref_aligned_start".to_string(),
+            "ref_aligned_end".to_string(),
+        ];
 
         // Sort species names for consistent output
         let mut species_vec: Vec<_> = self.species.iter().collect();
@@ -97,9 +123,18 @@ impl AlignmentStatistics {
 
         for i in 0..species_vec.len() {
             for j in (i + 1)..species_vec.len() {
-                headers.push(format!("{}_{}_subst_rate", species_vec[i], species_vec[j]));
-                headers.push(format!("{}_{}_gap_rate", species_vec[i], species_vec[j]));
-                headers.push(format!("{}_{}_num_valid", species_vec[i], species_vec[j]));
+                let species_a = species_vec[i];
+                let species_b = species_vec[j];
+                // NOTE: this must match the order exactly as in
+                // write_stats.
+                let species_label = format!("{}_{}", species_a, species_b);
+                headers.push(format!("{}_subst_rate", species_label));
+                headers.push(format!("{}_gap_rate", species_label));
+                headers.push(format!("{}_num_subst", species_label));
+                headers.push(format!("{}_num_single_gaps", species_label));
+                headers.push(format!("{}_num_double_gaps", species_label));
+                headers.push(format!("{}_valid_positions", species_label));
+                headers.push(format!("{}_total_positions", species_label));
             }
         }
 
@@ -111,11 +146,15 @@ impl AlignmentStatistics {
         &mut self,
         stats: &RegionStats,
         species_dict: &SpeciesDictionary,
+        block: &MafBlock,
     ) -> Result<(), StatsError> {
+        let (ref_start, ref_end) = block.get_reference_region(species_dict);
         let mut record = vec![
             stats.chrom.clone(),
             stats.start.to_string(),
             stats.end.to_string(),
+            ref_start.to_string(),
+            ref_end.to_string(),
         ];
 
         // Sort species for consistent ordering
@@ -141,13 +180,22 @@ impl AlignmentStatistics {
                     (idx2, idx1)
                 };
 
+                // NOTE: this must match exactly as in write_header.
                 match stats.pairwise_stats.get(&pair) {
                     Some(pair_stats) => {
                         record.push(pair_stats.substitution_rate().to_string());
                         record.push(pair_stats.gap_rate().to_string());
-                        record.push(pair_stats.valid_positions.to_string());
+                        record.push(pair_stats.substitutions.to_string());
+                        record.push(pair_stats.single_gaps.to_string());
+                        record.push(pair_stats.double_gaps.to_string());
+                        record.push(pair_stats.valid_positions().to_string());
+                        record.push(pair_stats.total_positions.to_string());
                     }
                     None => {
+                        record.push("NA".to_string());
+                        record.push("NA".to_string());
+                        record.push("NA".to_string());
+                        record.push("NA".to_string());
                         record.push("NA".to_string());
                         record.push("NA".to_string());
                         record.push("NA".to_string());
@@ -159,6 +207,10 @@ impl AlignmentStatistics {
         self.writer.write_record(&record)?;
         Ok(())
     }
+}
+
+pub fn calc_overlap(start1: u32, end1: u32, start2: u32, end2: u32) -> u32 {
+    end1.min(end2).saturating_sub(start1.max(start2))
 }
 
 pub fn is_gap(b: u8) -> bool {
@@ -244,18 +296,30 @@ pub fn calc_alignment_block_statistics(
 
             let mut pair_stats = PairwiseStats::default();
 
+            assert_eq!(seq1_bytes.len(), seq2_bytes.len());
+            pair_stats.total_positions = seq1_bytes.len() as u32;
             for (b1, b2) in seq1_bytes.iter().zip(seq2_bytes.iter()) {
                 if is_gap(*b1) && is_gap(*b2) {
-                    continue; // Matching gaps
+                    pair_stats.double_gaps += 1; // Count double gaps (in both ref and alt)
                 } else if is_gap(*b1) || is_gap(*b2) {
-                    pair_stats.gaps += 1; // One gap
+                    pair_stats.single_gaps += 1; // Count single gaps (in either ref or alt)
                 } else {
                     // Both are bases
-                    pair_stats.valid_positions += 1;
                     if !compare_bases(*b1, *b2) {
                         pair_stats.substitutions += 1;
+                    } else {
+                        pair_stats.matches += 1; // Add explicit tracking of matches
                     }
                 }
+            }
+
+            // Ensure that all the accounting adds up.
+            pair_stats.check_valid();
+
+            // Check that all overlapping bases are accounted for.
+            if let (Some(start), Some(end)) = (region_start, region_end) {
+                let overlap = calc_overlap(start, end, block_start, block_end);
+                assert_eq!(overlap, pair_stats.total_positions);
             }
 
             let species_pair = if seq1.species_idx < seq2.species_idx {
@@ -310,8 +374,9 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
-        assert_eq!(pair_stats.gaps, 0);
-        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.single_gaps, 0);
+        assert_eq!(pair_stats.double_gaps, 0);
+        assert_eq!(pair_stats.total_positions, 4);
         assert_eq!(pair_stats.substitution_rate(), 0.0);
         assert_eq!(pair_stats.gap_rate(), 0.0);
     }
@@ -325,8 +390,9 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 4);
-        assert_eq!(pair_stats.gaps, 0);
-        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.single_gaps, 0);
+        assert_eq!(pair_stats.double_gaps, 0);
+        assert_eq!(pair_stats.total_positions, 4);
         assert_eq!(pair_stats.substitution_rate(), 1.0);
         assert_eq!(pair_stats.gap_rate(), 0.0);
     }
@@ -340,8 +406,10 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
-        assert_eq!(pair_stats.gaps, 1);
-        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.single_gaps, 1);
+        assert_eq!(pair_stats.double_gaps, 0);
+        assert_eq!(pair_stats.total_positions, 5);
+        assert_eq!(pair_stats.valid_positions(), 4);
         assert_eq!(pair_stats.substitution_rate(), 0.0);
         assert_eq!(pair_stats.gap_rate(), 0.2); // 1 gap out of 5 total positions
     }
@@ -355,8 +423,10 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
-        assert_eq!(pair_stats.gaps, 0); // Matching gaps don't count
-        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.single_gaps, 0); // Matching "double" gaps don't count
+        assert_eq!(pair_stats.double_gaps, 2); // Here double gaps do count.
+        assert_eq!(pair_stats.total_positions, 6);
+        assert_eq!(pair_stats.valid_positions(), 4);
         assert_eq!(pair_stats.substitution_rate(), 0.0);
         assert_eq!(pair_stats.gap_rate(), 0.0);
     }
@@ -370,8 +440,9 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0); // Should handle case-insensitive comparison
-        assert_eq!(pair_stats.gaps, 0);
-        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.single_gaps, 0);
+        assert_eq!(pair_stats.double_gaps, 0);
+        assert_eq!(pair_stats.total_positions, 4);
         assert_eq!(pair_stats.substitution_rate(), 0.0);
         assert_eq!(pair_stats.gap_rate(), 0.0);
     }
@@ -385,8 +456,9 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
-        assert_eq!(pair_stats.gaps, 2); // Two non-matching gaps
-        assert_eq!(pair_stats.valid_positions, 3);
+        assert_eq!(pair_stats.single_gaps, 2); // Two non-matching gaps
+        assert_eq!(pair_stats.double_gaps, 0); // Two non-matching gaps
+        assert_eq!(pair_stats.total_positions, 5);
         assert_eq!(pair_stats.substitution_rate(), 0.0);
         assert_eq!(pair_stats.gap_rate(), 0.4); // 2 gaps out of 5 total positions
     }
@@ -400,8 +472,9 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
-        assert_eq!(pair_stats.gaps, 1); // Dots count as gaps
-        assert_eq!(pair_stats.valid_positions, 4);
+        assert_eq!(pair_stats.single_gaps, 1); // Dots count as gaps
+        assert_eq!(pair_stats.double_gaps, 0);
+        assert_eq!(pair_stats.total_positions, 5);
         assert_eq!(pair_stats.substitution_rate(), 0.0);
         assert_eq!(pair_stats.gap_rate(), 0.2);
     }
@@ -415,8 +488,9 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
-        assert_eq!(pair_stats.gaps, 0);
-        assert_eq!(pair_stats.valid_positions, 0);
+        assert_eq!(pair_stats.single_gaps, 0);
+        assert_eq!(pair_stats.double_gaps, 0);
+        assert_eq!(pair_stats.total_positions, 0);
         assert_eq!(pair_stats.substitution_rate(), 0.0);
         assert_eq!(pair_stats.gap_rate(), 0.0);
     }
@@ -434,7 +508,7 @@ mod tests {
             pair_stats.substitutions, 0,
             "Case difference should not count as substitution"
         );
-        assert_eq!(pair_stats.valid_positions, 8);
+        assert_eq!(pair_stats.total_positions, 8);
     }
 
     #[test]
@@ -450,8 +524,10 @@ mod tests {
             pair_stats.substitutions, 0,
             "Case difference should not count as substitution"
         );
-        assert_eq!(pair_stats.gaps, 2);
-        assert_eq!(pair_stats.valid_positions, 3);
+        assert_eq!(pair_stats.single_gaps, 2);
+        assert_eq!(pair_stats.double_gaps, 0);
+        assert_eq!(pair_stats.total_positions, 5);
+        assert_eq!(pair_stats.valid_positions(), 3);
     }
 
     #[test]
@@ -465,7 +541,27 @@ mod tests {
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 1);
-        assert_eq!(pair_stats.gaps, 2);
-        assert_eq!(pair_stats.valid_positions, 3);
+        assert_eq!(pair_stats.single_gaps, 2);
+        assert_eq!(pair_stats.double_gaps, 0);
+        assert_eq!(pair_stats.total_positions, 5);
+        assert_eq!(pair_stats.valid_positions(), 3);
+    }
+
+    #[test]
+    fn test_gap_rate_calculation() {
+        #[rustfmt::skip]
+        let block = create_test_block("A--TC--G", 
+                                      "AT-TC-GG");
+        let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
+        let stats =
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+
+        let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
+        assert_eq!(pair_stats.substitutions, 0);
+        assert_eq!(pair_stats.single_gaps, 2); // Three positions where only one sequence has a gap
+        assert_eq!(pair_stats.double_gaps, 2); // Two positions where both sequences have gaps
+        assert_eq!(pair_stats.total_positions, 8);
+        assert_eq!(pair_stats.valid_positions(), 4);
+        assert_eq!(pair_stats.gap_rate(), 1. / 3.);
     }
 }

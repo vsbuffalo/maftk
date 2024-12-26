@@ -85,6 +85,14 @@ pub struct MafBlock {
 }
 
 impl MafBlock {
+    /// Get the reference aligned sequence (first
+    /// in the sequences attribute).
+    pub fn get_reference_region(&self, species_dict: &SpeciesDictionary) -> (u32, u32) {
+        let ref_seq = self.sequences.first().unwrap();
+        let _ref_species = species_dict.get_species(ref_seq.species_idx);
+        (ref_seq.start, ref_seq.start + ref_seq.size)
+    }
+
     pub fn calc_stats(
         &self,
         start: Option<u32>,
@@ -345,20 +353,21 @@ pub fn query_alignments(
     Ok((blocks, species_dict.clone()))
 }
 
-pub fn print_block_statistics(
-    block_idx: usize,
+pub fn calc_block_statistics(
     stats: &RegionStats,
     species_dict: &SpeciesDictionary,
     focal_species: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Block {} Statistics:", block_idx);
-
+) -> Result<DataFrame, Box<dyn std::error::Error>> {
     // Create vectors to store data for DataFrame
     let mut species1 = Vec::new();
     let mut species2 = Vec::new();
     let mut subst_rates = Vec::new();
     let mut gap_rates = Vec::new();
-    let mut positions = Vec::new();
+    let mut num_subst = Vec::new();
+    let mut num_single_gaps = Vec::new();
+    let mut num_double_gaps = Vec::new();
+    let mut valid_positions = Vec::new();
+    let mut total_positions = Vec::new();
 
     // Collect data for each species pair
     for ((sp1_idx, sp2_idx), pair_stats) in &stats.pairwise_stats {
@@ -375,7 +384,11 @@ pub fn print_block_statistics(
         species2.push(sp2_name.to_string());
         subst_rates.push(pair_stats.substitution_rate() * 100.0);
         gap_rates.push(pair_stats.gap_rate() * 100.0);
-        positions.push(pair_stats.valid_positions);
+        num_subst.push(pair_stats.substitutions);
+        num_single_gaps.push(pair_stats.single_gaps);
+        num_double_gaps.push(pair_stats.double_gaps);
+        valid_positions.push(pair_stats.valid_positions());
+        total_positions.push(pair_stats.total_positions);
     }
 
     // Create DataFrame using df! macro
@@ -384,7 +397,11 @@ pub fn print_block_statistics(
         "Species 2" => &species2,
         "Substitution Rate %" => &subst_rates,
         "Gap Rate %" => &gap_rates,
-        "Valid Positions" => &positions
+        "Num Substitutions" => &num_subst,
+        "Num Single Gaps" => &num_single_gaps,
+        "Num Double Gaps" => &num_double_gaps,
+        "Valid Positions" => &valid_positions,
+        "Total Positions" => &total_positions,
     }?;
 
     // Sort by substitution rate (descending)
@@ -396,10 +413,22 @@ pub fn print_block_statistics(
         )
         .collect()?;
 
+    Ok(df)
+}
+
+pub fn print_block_statistics(df: &DataFrame, block_idx: usize) {
+    println!("Block {} Statistics:", block_idx);
+    unsafe {
+        if std::env::var("POLARS_FMT_MAX_COLS").is_err() {
+            std::env::set_var("POLARS_FMT_MAX_COLS", "-1");
+        }
+        if std::env::var("POLARS_FMT_MAX_ROWS").is_err() {
+            std::env::set_var("POLARS_FMT_MAX_ROWS", "-1");
+        }
+    }
     // Print formatted table
     println!("\nAlignment Statistics (sorted by substitution rate):");
     println!("{}", df);
-    Ok(())
 }
 
 pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary, color: bool) {
@@ -519,7 +548,7 @@ pub fn stats_command(
                 block.calc_stats(Some(start), Some(end), Some(&species_indices))
             {
                 block_stats.chrom = chrom.clone(); // Set chromosome
-                stats_writer.write_stats(&block_stats, &species_dict)?;
+                stats_writer.write_stats(&block_stats, &species_dict, &block)?;
             } else {
                 panic!("No statistics returned due to no overlaps: internal error.");
             };

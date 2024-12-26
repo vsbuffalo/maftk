@@ -2,11 +2,13 @@
 use clap::Parser;
 use hgindex::BinningIndex;
 use maftk::binary::{
-    convert_to_binary, convert_to_binary_glob, print_alignments, print_block_statistics,
-    query_alignments,
+    calc_block_statistics, convert_to_binary, convert_to_binary_glob, print_alignments,
+    print_block_statistics, query_alignments,
 };
 use maftk::binary::{stats_command, SpeciesDictionary};
-use maftk::io::MafReader;
+use maftk::io::{MafReader, OutputFile};
+use polars::io::csv::write::CsvWriter;
+use polars::io::SerWriter;
 use std::collections::HashSet;
 use std::fs::create_dir_all;
 use std::fs::File;
@@ -76,10 +78,10 @@ enum Commands {
         #[arg(short, long, default_value = "maf.mmdb")]
         data_dir: PathBuf,
 
-        /// Optional directory to output FASTA files for all overlapping alignment regions.
-        /// If not specified
+        /// Optional directory to output FASTA files or TSV block statistics files
+        /// for all overlapping alignment regions.
         #[arg(short, long)]
-        fasta_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
 
         /// Don't color
         #[arg(short, long)]
@@ -90,9 +92,10 @@ enum Commands {
         #[arg(short, long)]
         intersect_only: bool,
 
-        /// Print statistics of alignments only.
+        /// Output (if --output-dir set) or print statistics of alignments only
+        /// (not actual alignments).
         #[arg(short, long)]
-        print_stats: bool,
+        stats: bool,
 
         /// Show all pairwise alignments with --print-stats, not just
         /// the pairwise statistics with the reference species/source.
@@ -331,10 +334,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             start,
             end,
             data_dir,
-            fasta_dir,
+            output_dir,
             no_color,
             intersect_only,
-            print_stats,
+            stats,
             all_pairwise,
         } => {
             let end = end.unwrap_or(start + 1);
@@ -347,17 +350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (blocks, species_dict) =
                 query_alignments(&data_dir, &chromosome, start, end, intersect_only)?;
 
-            if let Some(dir) = fasta_dir {
-                create_dir_all(&dir)?;
-                for (i, block) in blocks.iter().enumerate() {
-                    let filepath = format!("block_{}.fa.gz", i);
-                    let path = dir.join(&filepath);
-                    block.write_fasta(&path, &species_dict, &chromosome)?;
-                }
-            } else if !print_stats {
-                // We print to screen rather than write to FASTA directory.
-                print_alignments(blocks, &species_dict, !no_color);
-            } else {
+            if stats {
                 for (i, block) in blocks.iter().enumerate() {
                     let focal_species = if all_pairwise {
                         None
@@ -369,11 +362,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     if let Some(stats) = block.calc_stats(Some(start), Some(end), None) {
-                        print_block_statistics(i, &stats, &species_dict, focal_species)?;
+                        let mut df = calc_block_statistics(&stats, &species_dict, focal_species)?;
+                        if let Some(dir) = output_dir.as_ref() {
+                            create_dir_all(dir)?;
+                            let filepath = format!("block_{}.tsv.gz", i);
+                            let path = dir.join(&filepath);
+                            let writer = OutputFile::new(&path).writer()?;
+                            CsvWriter::new(writer)
+                                .include_header(true)
+                                .with_separator(b'\t')
+                                .finish(&mut df)?;
+                        } else {
+                            print_block_statistics(&df, i);
+                        }
                     } else {
                         warn!("Block {} didn't have statistics", i);
                     }
                 }
+            } else if let Some(dir) = output_dir {
+                create_dir_all(&dir)?;
+                for (i, block) in blocks.iter().enumerate() {
+                    let filepath = format!("block_{}.fa.gz", i);
+                    let path = dir.join(&filepath);
+                    block.write_fasta(&path, &species_dict, &chromosome)?;
+                }
+            } else {
+                // We print to screen rather than write to FASTA directory.
+                print_alignments(blocks, &species_dict, !no_color);
             }
         }
         Commands::Stats {
