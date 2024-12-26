@@ -1,9 +1,11 @@
 // binary.rs
 
 use colored::*;
+use core::panic;
 use csv::ReaderBuilder;
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
+use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -60,8 +62,11 @@ impl SpeciesDictionary {
     }
 }
 
-// Compact metadata for each sequence in the alignment
-// TODO: this is redundant with Sequence.
+/// Compact metadata for each sequence in the alignment
+///
+/// Note: this is somewhat like Sequence in io.rs, expect it is designed to be a type more
+/// optimized for binary serialization. In particular, the species (src in the lower structure) is
+/// now just a u32 index.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AlignedSequence {
     pub species_idx: u32, // Index into species dictionary
@@ -289,20 +294,47 @@ pub fn convert_to_binary(
     Ok(())
 }
 
-// Query overlapping alignments
 pub fn query_alignments(
     data_dir: &Path,
     chrom: &str,
     start: u32,
     end: u32,
+    intersect_only: bool,
 ) -> Result<(Vec<MafBlock>, SpeciesDictionary), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
-    let blocks: Vec<MafBlock> = store.get_overlapping(chrom, start - 1, end);
+    let mut blocks: Vec<MafBlock> = store.get_overlapping(chrom, start, end);
     let query_time = total_time.elapsed();
 
-    // Use the store's metadata to get species names
+    // Get the store's metadata for species names
     let species_dict = store.metadata().unwrap();
+
+    if intersect_only {
+        // Filter blocks to only keep sequences that overlap in all blocks
+        let mut common_species: Option<HashSet<u32>> = None;
+
+        for block in &blocks {
+            let block_species: HashSet<u32> =
+                block.sequences.iter().map(|seq| seq.species_idx).collect();
+
+            common_species = match common_species {
+                None => Some(block_species),
+                Some(species) => Some(&species & &block_species),
+            };
+        }
+
+        if let Some(common_species) = common_species {
+            blocks = blocks
+                .into_iter()
+                .map(|mut block| {
+                    block
+                        .sequences
+                        .retain(|seq| common_species.contains(&seq.species_idx));
+                    block
+                })
+                .collect();
+        }
+    }
 
     info!(
         "Query elapsed {:?}, {} overlapping alignment block{} found.",
@@ -313,14 +345,68 @@ pub fn query_alignments(
     Ok((blocks, species_dict.clone()))
 }
 
+pub fn print_block_statistics(
+    block_idx: usize,
+    stats: &RegionStats,
+    species_dict: &SpeciesDictionary,
+    focal_species: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Block {} Statistics:", block_idx);
+
+    // Create vectors to store data for DataFrame
+    let mut species1 = Vec::new();
+    let mut species2 = Vec::new();
+    let mut subst_rates = Vec::new();
+    let mut gap_rates = Vec::new();
+    let mut positions = Vec::new();
+
+    // Collect data for each species pair
+    for ((sp1_idx, sp2_idx), pair_stats) in &stats.pairwise_stats {
+        let sp1_name = species_dict.get_species(*sp1_idx).unwrap_or("unknown");
+        let sp2_name = species_dict.get_species(*sp2_idx).unwrap_or("unknown");
+
+        if let Some(focal) = focal_species {
+            if sp1_name != focal && sp2_name != focal {
+                continue;
+            }
+        }
+
+        species1.push(sp1_name.to_string());
+        species2.push(sp2_name.to_string());
+        subst_rates.push(pair_stats.substitution_rate() * 100.0);
+        gap_rates.push(pair_stats.gap_rate() * 100.0);
+        positions.push(pair_stats.valid_positions);
+    }
+
+    // Create DataFrame using df! macro
+    let mut df = df! {
+        "Species 1" => &species1,
+        "Species 2" => &species2,
+        "Substitution Rate %" => &subst_rates,
+        "Gap Rate %" => &gap_rates,
+        "Valid Positions" => &positions
+    }?;
+
+    // Sort by substitution rate (descending)
+    df = df
+        .lazy()
+        .sort_by_exprs(
+            vec![col("Substitution Rate %")],
+            SortMultipleOptions::default(),
+        )
+        .collect()?;
+
+    // Print formatted table
+    println!("\nAlignment Statistics (sorted by substitution rate):");
+    println!("{}", df);
+    Ok(())
+}
+
 pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary, color: bool) {
     let has_blocks = !blocks.is_empty();
     for (i, block) in blocks.into_iter().enumerate() {
         println!("[block {} | score {}]", i, block.score);
         block.pretty_print_alignments(species_dict, color);
-        //if let Some(stats) = block.calc_stats(None, None, None) {
-        //    println!("{:}", stats);
-        //}
     }
     if has_blocks {
         // Print legend
@@ -434,6 +520,8 @@ pub fn stats_command(
             {
                 block_stats.chrom = chrom.clone(); // Set chromosome
                 stats_writer.write_stats(&block_stats, &species_dict)?;
+            } else {
+                panic!("No statistics returned due to no overlaps: internal error.");
             };
         }
 

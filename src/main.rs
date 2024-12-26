@@ -2,7 +2,8 @@
 use clap::Parser;
 use hgindex::BinningIndex;
 use maftk::binary::{
-    convert_to_binary, convert_to_binary_glob, print_alignments, query_alignments,
+    convert_to_binary, convert_to_binary_glob, print_alignments, print_block_statistics,
+    query_alignments,
 };
 use maftk::binary::{stats_command, SpeciesDictionary};
 use maftk::io::MafReader;
@@ -11,6 +12,7 @@ use std::fs::create_dir_all;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 #[derive(Parser)]
 #[command(name = "maftools")]
@@ -82,6 +84,20 @@ enum Commands {
         /// Don't color
         #[arg(short, long)]
         no_color: bool,
+
+        /// Only consider intersecting region only (i.e. inner join,
+        /// rather than the default right outer join).
+        #[arg(short, long)]
+        intersect_only: bool,
+
+        /// Print statistics of alignments only.
+        #[arg(short, long)]
+        print_stats: bool,
+
+        /// Show all pairwise alignments with --print-stats, not just
+        /// the pairwise statistics with the reference species/source.
+        #[arg(short, long)]
+        all_pairwise: bool,
     },
     /// Calculate an alignment statistics table for all alignments
     /// in the supplied BED file.
@@ -258,14 +274,6 @@ fn split_maf(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    //match check_bin_offsets() {
-    //    Ok(_) => {
-    //        println!("No bin offset clashes detected.");
-    //    }
-    //    Err(e) => {
-    //        println!("Error: {}", e);
-    //    }
-    //}
     let cli = Cli::parse();
 
     // Set up tracing level based on verbosity argument
@@ -325,6 +333,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_dir,
             fasta_dir,
             no_color,
+            intersect_only,
+            print_stats,
+            all_pairwise,
         } => {
             let end = end.unwrap_or(start + 1);
             if end <= start {
@@ -333,7 +344,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Get the overlapping alignment blocks
-            let (blocks, species_dict) = query_alignments(&data_dir, &chromosome, start, end)?;
+            let (blocks, species_dict) =
+                query_alignments(&data_dir, &chromosome, start, end, intersect_only)?;
 
             if let Some(dir) = fasta_dir {
                 create_dir_all(&dir)?;
@@ -342,10 +354,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let path = dir.join(&filepath);
                     block.write_fasta(&path, &species_dict, &chromosome)?;
                 }
-            } else {
+            } else if !print_stats {
                 // We print to screen rather than write to FASTA directory.
                 print_alignments(blocks, &species_dict, !no_color);
-            };
+            } else {
+                for (i, block) in blocks.iter().enumerate() {
+                    let focal_species = if all_pairwise {
+                        None
+                    } else {
+                        // the first sequence in the block is always the reference,
+                        // and thus from the reference source/species.
+                        let idx = block.sequences[0].species_idx;
+                        Some(species_dict.get_species(idx).unwrap())
+                    };
+
+                    if let Some(stats) = block.calc_stats(Some(start), Some(end), None) {
+                        print_block_statistics(i, &stats, &species_dict, focal_species)?;
+                    } else {
+                        warn!("Block {} didn't have statistics", i);
+                    }
+                }
+            }
         }
         Commands::Stats {
             regions,

@@ -3,6 +3,7 @@ use csv::{Writer, WriterBuilder};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use thiserror::Error;
+use tracing::info;
 
 use crate::binary::{MafBlock, SpeciesDictionary};
 use crate::io::OutputFile;
@@ -17,9 +18,9 @@ pub enum StatsError {
 
 #[derive(Clone, Default, Debug)]
 pub struct PairwiseStats {
-    pub(crate) substitutions: u32,
-    pub(crate) gaps: u32,
-    pub(crate) valid_positions: u32,
+    pub substitutions: u32,
+    pub gaps: u32,
+    pub valid_positions: u32,
 }
 
 impl std::fmt::Display for PairwiseStats {
@@ -33,7 +34,7 @@ impl std::fmt::Display for PairwiseStats {
 }
 
 impl PairwiseStats {
-    fn substitution_rate(&self) -> f64 {
+    pub fn substitution_rate(&self) -> f64 {
         if self.valid_positions == 0 {
             0.0
         } else {
@@ -41,7 +42,7 @@ impl PairwiseStats {
         }
     }
 
-    fn gap_rate(&self) -> f64 {
+    pub fn gap_rate(&self) -> f64 {
         if self.valid_positions == 0 && self.gaps == 0 {
             0.0
         } else {
@@ -98,6 +99,7 @@ impl AlignmentStatistics {
             for j in (i + 1)..species_vec.len() {
                 headers.push(format!("{}_{}_subst_rate", species_vec[i], species_vec[j]));
                 headers.push(format!("{}_{}_gap_rate", species_vec[i], species_vec[j]));
+                headers.push(format!("{}_{}_num_valid", species_vec[i], species_vec[j]));
             }
         }
 
@@ -143,8 +145,10 @@ impl AlignmentStatistics {
                     Some(pair_stats) => {
                         record.push(pair_stats.substitution_rate().to_string());
                         record.push(pair_stats.gap_rate().to_string());
+                        record.push(pair_stats.valid_positions.to_string());
                     }
                     None => {
+                        record.push("NA".to_string());
                         record.push("NA".to_string());
                         record.push("NA".to_string());
                     }
@@ -188,6 +192,10 @@ pub fn calc_alignment_block_statistics(
     let (start_offset, length) = if let (Some(start), Some(end)) = (region_start, region_end) {
         // Check if there's any overlap
         if end <= block_start || start >= block_end {
+            info!(
+                "No overlap between block [{}, {}) and region [{}, {})",
+                block_start, block_end, start, end
+            );
             return None;
         }
 
@@ -267,7 +275,6 @@ mod tests {
     use crate::binary::AlignedSequence;
 
     use super::*;
-    use std::collections::HashSet;
 
     // Helper function to create a MafBlock with two sequences
     fn create_test_block(seq1: &str, seq2: &str) -> MafBlock {

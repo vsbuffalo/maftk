@@ -27,7 +27,10 @@ pub struct MafHeader {
 }
 
 /// Represents a sequence within an alignment block
-// TODO: this is redundant with AlignedSequence!
+///
+/// Note: This is the MAF parsing-level struct, compared to AlignedSequence which intended more for
+/// the binary-level representation.
+/// Thus these are optimized for different parts of our pipeline.
 #[derive(Debug, Clone)]
 pub struct Sequence {
     /// Source sequence name (e.g. the species' genome version)

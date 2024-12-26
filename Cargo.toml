@@ -13,6 +13,7 @@ glob = "0.3.1"
 hgindex = { git = "https://github.com/vsbuffalo/hgindex", version = "0.1.0" }
 indicatif = "0.17.9"
 lazy_static = "1.5.0"
+polars = { version = "0.45.1", features = ["lazy"] }
 serde = { version = "1.0.216", features = ["derive"] }
 thiserror = "2.0.3"
 tracing = "0.1.41"
