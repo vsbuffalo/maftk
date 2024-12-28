@@ -3,6 +3,9 @@
 use colored::*;
 use core::panic;
 use csv::ReaderBuilder;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 use polars::prelude::*;
@@ -10,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
+use std::io::prelude::*;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -19,9 +23,8 @@ use tracing::{info, warn};
 use hgindex::GenomicDataStore;
 
 use crate::io::{InputFile, MafReader, OutputFile, Strand};
-use crate::statistics::{
-    calc_alignment_block_statistics, compare_bases, is_gap, AlignmentStatistics, RegionStats,
-};
+use crate::statistics::{calc_alignment_block_statistics, AlignmentStatistics, RegionStats};
+use crate::statistics::{compare_bases, is_gap};
 
 // Species dictionary to avoid storing repetitive strings
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,7 +77,39 @@ pub struct AlignedSequence {
     pub size: u32,        // Size of aligning region
     pub strand: bool,     // false for forward (+), true for reverse (-)
     pub src_size: u32,    // Total size of source sequence
-    pub text: String,     // Raw sequence
+    #[serde(with = "compressed_text")]
+    pub text: String, // Raw sequence
+}
+
+mod compressed_text {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(text: &str, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Create a compression encoder
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder
+            .write_all(text.as_bytes())
+            .map_err(serde::ser::Error::custom)?;
+        let compressed = encoder.finish().map_err(serde::ser::Error::custom)?;
+        serializer.serialize_bytes(&compressed)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let compressed = Vec::<u8>::deserialize(deserializer)?;
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut decompressed = String::new();
+        decoder
+            .read_to_string(&mut decompressed)
+            .map_err(serde::de::Error::custom)?;
+        Ok(decompressed)
+    }
 }
 
 // Modified MafBlock to include metadata
@@ -85,6 +120,23 @@ pub struct MafBlock {
 }
 
 impl MafBlock {
+    /// Helper method to estimate compression savings.
+    pub fn estimate_size(&self) -> (usize, usize) {
+        let uncompressed: usize = self.sequences.iter().map(|s| s.text.len()).sum();
+
+        // Estimate compressed size by actually compressing
+        let mut total_compressed = 0;
+        for seq in &self.sequences {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(seq.text.as_bytes()).unwrap_or_default();
+            if let Ok(compressed) = encoder.finish() {
+                total_compressed += compressed.len();
+            }
+        }
+
+        (uncompressed, total_compressed)
+    }
+
     /// Get the reference aligned sequence (first
     /// in the sequences attribute).
     pub fn get_reference_region(&self, species_dict: &SpeciesDictionary) -> (u32, u32) {
@@ -246,8 +298,12 @@ pub fn convert_to_binary(
 
     // Create store with species dictionary
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::create(output_dir, None)?;
-
     store.set_metadata(SpeciesDictionary::new());
+
+    // Track compression statistics
+    let mut total_uncompressed = 0;
+    let mut total_compressed = 0;
+    let mut block_count = 0;
 
     while let Some(block) = maf.next_block()? {
         if block.sequences[0].size < min_length {
@@ -287,6 +343,12 @@ pub fn convert_to_binary(
             sequences: alignment_strings,
         };
 
+        // Get size estimates for this block
+        let (uncompressed, compressed) = record.estimate_size();
+        total_uncompressed += uncompressed;
+        total_compressed += compressed;
+        block_count += 1;
+
         store.add_record(
             chr,
             ref_seq.start as u32,
@@ -294,6 +356,15 @@ pub fn convert_to_binary(
             &record,
         )?;
     }
+
+    // Print compression statistics
+    info!(
+        "Compression stats - Original: {:.2} MB, Compressed: {:.2} MB, Ratio: {:.2}%, Blocks: {}",
+        total_uncompressed as f64 / 1_000_000.0,
+        total_compressed as f64 / 1_000_000.0,
+        (total_compressed as f64 / total_uncompressed as f64) * 100.0,
+        block_count
+    );
 
     // Finalize the store
     store.finalize()?;
