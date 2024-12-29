@@ -101,6 +101,7 @@ impl MafBlock {
     ) -> Option<RegionStats> {
         calc_alignment_block_statistics(self, species_indices, start, end)
     }
+
     pub fn pretty_print_alignments(&self, species_dict: &SpeciesDictionary, color: bool) {
         let alignments: Vec<(String, String, u32, bool)> = self
             .sequences
@@ -112,13 +113,9 @@ impl MafBlock {
                     .get_species(aligned.species_idx)
                     .unwrap_or(label);
                 (
-                    // species name
                     species_name.to_string(),
-                    // aligned sequence
                     aligned.text.clone(),
-                    // start position
                     aligned.start,
-                    // end position
                     aligned.strand,
                 )
             })
@@ -128,29 +125,35 @@ impl MafBlock {
             return;
         }
 
-        // Get reference sequence (first sequence)
         let ref_alignment = &alignments[0];
         let reference = &ref_alignment.1;
 
-        // Calculate the maximum identifier length for padding
-        let max_id_len = alignments
-            .iter()
-            .map(|(id, _, _, _)| id.len())
-            .max()
-            .unwrap_or(0);
+        // Calculate exact label width by creating a sample label
+        let label_width = {
+            let sample_label = format!(
+                "{:<10} {:>10} {}",
+                "",  // empty species name of width 10
+                0,   // sample position
+                "+"  // sample strand
+            );
+            sample_label.len()
+        };
 
         // Print header with sequence positions
-        print!("{:width$} ", "", width = max_id_len + 15); // Increased padding for coordinates
-        for (i, _) in reference.chars().enumerate() {
+        print!("{:width$} ", "", width = label_width);
+        let mut ref_pos = 0; // Track actual reference position
+        for (i, base) in reference.chars().enumerate() {
             if i % 10 == 0 {
-                print!("{:<10}", i);
+                print!("{:<10}", ref_pos);
+            }
+            if base != '-' {
+                ref_pos += 1; // Only increment reference position for non-gaps
             }
         }
         println!();
 
         // Print each sequence with optional color coding
         for (id, sequence, start_pos, is_reverse) in &alignments {
-            // Calculate and format coordinates
             let strand = if *is_reverse { "-" } else { "+" };
             let coord_label = format!(
                 "{:<10} {:>10} {}",
@@ -160,7 +163,7 @@ impl MafBlock {
             );
 
             // Print identifier and coordinates with padding
-            print!("{:width$} ", coord_label, width = max_id_len + 15);
+            print!("{:width$} ", coord_label, width = label_width);
 
             // For the reference sequence, just print it normally
             if id == &alignments[0].0 {
@@ -291,7 +294,7 @@ pub fn convert_to_binary(
             chr,
             ref_seq.start as u32,
             (ref_seq.start + ref_seq.size) as u32,
-            &record,
+            record,
         )?;
     }
 
@@ -310,8 +313,8 @@ pub fn query_alignments(
     intersect_only: bool,
 ) -> Result<(Vec<MafBlock>, SpeciesDictionary), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
-    let mut blocks: Vec<MafBlock> = store.get_overlapping(chrom, start, end);
+    let store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
+    let mut blocks: Vec<MafBlock> = store.get_overlapping(chrom, start, end)?;
     let query_time = total_time.elapsed();
 
     // Get the store's metadata for species names
@@ -516,7 +519,7 @@ pub fn stats_command(
         .from_reader(buf_reader);
 
     // Open store and get species dictionary
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
+    let store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
     let species_dict = store
         .metadata()
         .expect("Missing species dictionary")
@@ -536,7 +539,7 @@ pub fn stats_command(
         let end: u32 = record[2].parse()?;
 
         // Get overlapping blocks
-        let blocks: Vec<MafBlock> = store.get_overlapping(&chrom, start, end);
+        let blocks: Vec<MafBlock> = store.get_overlapping(&chrom, start, end)?;
 
         if blocks.is_empty() {
             continue;
@@ -644,7 +647,7 @@ pub fn convert_to_binary_glob(
                 chr,
                 ref_seq.start as u32,
                 (ref_seq.start + ref_seq.size) as u32,
-                &record,
+                record,
             )?;
         }
         progress.inc(1);

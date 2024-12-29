@@ -59,8 +59,11 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         min_length: u64,
     },
+
     /// Get alignments at a specific position or range, and either write to a directory (one FASTA
-    /// file per alignment) or print alignments.
+    /// file per alignment) or print alignments. Note that gaps in the reference sequence will
+    /// change the coordinates above the alignments, since the reference coordinate does not
+    /// increment at a gap position.
     Query {
         /// Chromosome name (e.g., chr22)
         #[arg(value_name = "chromosome")]
