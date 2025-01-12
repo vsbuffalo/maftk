@@ -282,7 +282,7 @@ pub fn calc_alignment_block_statistics(
         let seq1_meta = &block.sequence_metadata[i];
         if species_indices
             .as_ref()
-            .map_or(false, |indices| !indices.contains(&seq1_meta.species_idx))
+            .is_some_and(|indices| !indices.contains(&seq1_meta.species_idx))
         {
             continue;
         }
@@ -300,7 +300,7 @@ pub fn calc_alignment_block_statistics(
             let seq2_meta = &block.sequence_metadata[j];
             if species_indices
                 .as_ref()
-                .map_or(false, |indices| !indices.contains(&seq2_meta.species_idx))
+                .is_some_and(|indices| !indices.contains(&seq1_meta.species_idx))
             {
                 continue;
             }
