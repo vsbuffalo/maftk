@@ -236,7 +236,7 @@ pub fn calc_alignment_block_statistics(
     region_start: Option<u32>,
     region_end: Option<u32>,
 ) -> Option<RegionStats> {
-    let ref_seq = &block.sequences[0];
+    let ref_seq = &block.sequence_metadata[0];
     let block_start = ref_seq.start;
     let block_end = block_start + ref_seq.size;
 
@@ -272,48 +272,60 @@ pub fn calc_alignment_block_statistics(
         pairwise_stats: HashMap::new(),
     };
 
-    for i in 0..block.sequences.len() {
-        let seq1 = &block.sequences[i];
+    // Get all sequences at once to avoid multiple decompressions
+    let sequences = match block.get_sequences() {
+        Ok(seqs) => seqs,
+        Err(_) => return None,
+    };
+
+    for i in 0..block.sequence_metadata.len() {
+        let seq1_meta = &block.sequence_metadata[i];
         if species_indices
             .as_ref()
-            .map_or(false, |indices| !indices.contains(&seq1.species_idx))
+            .map_or(false, |indices| !indices.contains(&seq1_meta.species_idx))
         {
             continue;
         }
-        // Use slice of the sequence for the region of interest
-        let seq1_bytes = &seq1.text.as_bytes()[start_offset..start_offset + length];
 
-        for j in (i + 1)..block.sequences.len() {
-            let seq2 = &block.sequences[j];
+        let seq1_text = &sequences[i];
+        let seq1_bytes = seq1_text.as_bytes();
+        let seq1_slice = &seq1_bytes[start_offset..start_offset + length];
+
+        for (j, _) in sequences
+            .iter()
+            .enumerate()
+            .take(block.sequence_metadata.len())
+            .skip(i + 1)
+        {
+            let seq2_meta = &block.sequence_metadata[j];
             if species_indices
                 .as_ref()
-                .map_or(false, |indices| !indices.contains(&seq2.species_idx))
+                .map_or(false, |indices| !indices.contains(&seq2_meta.species_idx))
             {
                 continue;
             }
-            // Use slice of the sequence for the region of interest
-            let seq2_bytes = &seq2.text.as_bytes()[start_offset..start_offset + length];
+
+            let seq2_text = &sequences[j];
+            let seq2_bytes = seq2_text.as_bytes();
+            let seq2_slice = &seq2_bytes[start_offset..start_offset + length];
 
             let mut pair_stats = PairwiseStats::default();
 
-            assert_eq!(seq1_bytes.len(), seq2_bytes.len());
-            pair_stats.total_positions = seq1_bytes.len() as u32;
-            for (b1, b2) in seq1_bytes.iter().zip(seq2_bytes.iter()) {
+            assert_eq!(seq1_slice.len(), seq2_slice.len());
+            pair_stats.total_positions = seq1_slice.len() as u32;
+
+            for (b1, b2) in seq1_slice.iter().zip(seq2_slice.iter()) {
                 if is_gap(*b1) && is_gap(*b2) {
-                    pair_stats.double_gaps += 1; // Count double gaps (in both ref and alt)
+                    pair_stats.double_gaps += 1;
                 } else if is_gap(*b1) || is_gap(*b2) {
-                    pair_stats.single_gaps += 1; // Count single gaps (in either ref or alt)
+                    pair_stats.single_gaps += 1;
+                } else if !compare_bases(*b1, *b2) {
+                    pair_stats.substitutions += 1;
                 } else {
-                    // Both are bases
-                    if !compare_bases(*b1, *b2) {
-                        pair_stats.substitutions += 1;
-                    } else {
-                        pair_stats.matches += 1; // Add explicit tracking of matches
-                    }
+                    pair_stats.matches += 1;
                 }
             }
 
-            // Ensure that all the accounting adds up.
             pair_stats.check_valid();
 
             // Check that all overlapping bases are accounted for.
@@ -322,10 +334,10 @@ pub fn calc_alignment_block_statistics(
                 assert_eq!(overlap, pair_stats.total_positions);
             }
 
-            let species_pair = if seq1.species_idx < seq2.species_idx {
-                (seq1.species_idx, seq2.species_idx)
+            let species_pair = if seq1_meta.species_idx < seq2_meta.species_idx {
+                (seq1_meta.species_idx, seq2_meta.species_idx)
             } else {
-                (seq2.species_idx, seq1.species_idx)
+                (seq2_meta.species_idx, seq1_meta.species_idx)
             };
             stats.pairwise_stats.insert(species_pair, pair_stats);
         }
@@ -342,27 +354,30 @@ mod tests {
 
     // Helper function to create a MafBlock with two sequences
     fn create_test_block(seq1: &str, seq2: &str) -> MafBlock {
-        MafBlock {
-            score: 0.0,
-            sequences: vec![
+        let sequences = vec![
+            (
                 AlignedSequence {
                     species_idx: 0,
                     start: 0,
                     size: seq1.len() as u32,
                     strand: false,
                     src_size: seq1.len() as u32,
-                    text: seq1.to_string(),
                 },
+                seq1.to_string(),
+            ),
+            (
                 AlignedSequence {
                     species_idx: 1,
                     start: 0,
                     size: seq2.len() as u32,
                     strand: false,
                     src_size: seq2.len() as u32,
-                    text: seq2.to_string(),
                 },
-            ],
-        }
+                seq2.to_string(),
+            ),
+        ];
+
+        MafBlock::new(0.0, sequences).expect("Failed to create test block")
     }
 
     #[test]

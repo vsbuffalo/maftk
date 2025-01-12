@@ -3,6 +3,8 @@
 use colored::*;
 use core::panic;
 use csv::ReaderBuilder;
+use flate2::write::{DeflateDecoder, DeflateEncoder};
+use flate2::Compression;
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 use polars::prelude::*;
@@ -10,13 +12,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 use std::{collections::HashSet, path::Path};
 use tracing::{info, warn};
 
-use hgindex::GenomicDataStore;
+use hgindex::{GenomicCoordinates, GenomicDataStore};
 
 use crate::io::{InputFile, MafReader, OutputFile, Strand};
 use crate::statistics::{
@@ -62,6 +64,28 @@ impl SpeciesDictionary {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompressedText(Vec<u8>);
+
+impl CompressedText {
+    pub fn new(text: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(text.as_bytes())?;
+        Ok(CompressedText(encoder.finish()?))
+    }
+
+    pub fn decompress(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let mut decoder = DeflateDecoder::new(Vec::new());
+        decoder.write_all(&self.0)?;
+        let bytes = decoder.finish()?;
+        String::from_utf8(bytes).map_err(|e| e.into())
+    }
+
+    pub fn compression_ratio(&self) -> f64 {
+        self.0.len() as f64 / self.decompress().map(|s| s.len()).unwrap_or(1) as f64
+    }
+}
+
 /// Compact metadata for each sequence in the alignment
 ///
 /// Note: this is somewhat like Sequence in io.rs, expect it is designed to be a type more
@@ -74,23 +98,80 @@ pub struct AlignedSequence {
     pub size: u32,        // Size of aligning region
     pub strand: bool,     // false for forward (+), true for reverse (-)
     pub src_size: u32,    // Total size of source sequence
-    pub text: String,     // Raw sequence
 }
 
 // Modified MafBlock to include metadata
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MafBlock {
     pub score: f32,
-    pub sequences: Vec<AlignedSequence>,
+    pub sequence_metadata: Vec<AlignedSequence>,
+    compressed_text: CompressedText,
+    sequence_length: usize,
+}
+
+impl GenomicCoordinates for MafBlock {
+    fn start(&self) -> u32 {
+        let ref_seq = &self.sequence_metadata[0];
+        ref_seq.start
+    }
+
+    fn end(&self) -> u32 {
+        let ref_seq = &self.sequence_metadata[0];
+        ref_seq.start + ref_seq.size
+    }
 }
 
 impl MafBlock {
+    pub fn new(
+        score: f32,
+        sequences: Vec<(AlignedSequence, String)>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if sequences.is_empty() {
+            return Err("Cannot create MafBlock with no sequences".into());
+        }
+
+        let sequence_length = sequences[0].1.len();
+
+        // Combine all sequences into one string with newlines
+        let combined_text = sequences
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Extract just the metadata
+        let sequence_metadata = sequences.into_iter().map(|(meta, _)| meta).collect();
+
+        Ok(Self {
+            score,
+            sequence_metadata,
+            compressed_text: CompressedText::new(&combined_text)?,
+            sequence_length,
+        })
+    }
+
     /// Get the reference aligned sequence (first
     /// in the sequences attribute).
     pub fn get_reference_region(&self, species_dict: &SpeciesDictionary) -> (u32, u32) {
-        let ref_seq = self.sequences.first().unwrap();
+        let ref_seq = self.sequence_metadata.first().unwrap();
         let _ref_species = species_dict.get_species(ref_seq.species_idx);
         (ref_seq.start, ref_seq.start + ref_seq.size)
+    }
+
+    // Get a specific sequence by index
+    pub fn get_sequence(&self, idx: usize) -> Result<String, Box<dyn std::error::Error>> {
+        let text = self.compressed_text.decompress()?;
+        let lines: Vec<&str> = text.split('\n').collect();
+        if idx >= lines.len() {
+            return Err("Sequence index out of bounds".into());
+        }
+        Ok(lines[idx].to_string())
+    }
+
+    // Get all sequences
+    pub fn get_sequences(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let text = self.compressed_text.decompress()?;
+        Ok(text.split('\n').map(|s| s.to_string()).collect())
     }
 
     pub fn calc_stats(
@@ -101,25 +182,27 @@ impl MafBlock {
     ) -> Option<RegionStats> {
         calc_alignment_block_statistics(self, species_indices, start, end)
     }
+
     pub fn pretty_print_alignments(&self, species_dict: &SpeciesDictionary, color: bool) {
+        // Get all sequences at once
+        let sequences = match self.get_sequences() {
+            Ok(seqs) => seqs,
+            Err(_) => return,
+        };
+
         let alignments: Vec<(String, String, u32, bool)> = self
-            .sequences
+            .sequence_metadata
             .iter()
+            .zip(sequences.iter())
             .enumerate()
-            .map(|(idx, aligned)| {
+            .map(|(idx, (meta, text))| {
                 let label = &format!("seq_{}", idx);
-                let species_name = species_dict
-                    .get_species(aligned.species_idx)
-                    .unwrap_or(label);
+                let species_name = species_dict.get_species(meta.species_idx).unwrap_or(label);
                 (
-                    // species name
                     species_name.to_string(),
-                    // aligned sequence
-                    aligned.text.clone(),
-                    // start position
-                    aligned.start,
-                    // end position
-                    aligned.strand,
+                    text.to_string(),
+                    meta.start,
+                    meta.strand,
                 )
             })
             .collect();
@@ -191,32 +274,33 @@ impl MafBlock {
         }
     }
 
-    pub fn format_fasta(&self, species_dict: &SpeciesDictionary, chrom: &str) -> String {
-        // Map each sequence to its FASTA format and collect into a vector
-        let fasta_entries: Vec<String> = self
-            .sequences
-            .iter()
-            .map(|seq| {
-                let species = species_dict
-                    .get_species(seq.species_idx)
-                    .unwrap_or("unknown");
-                // Include chromosome, strand information and coordinates
-                let strand = if seq.strand { "-" } else { "+" };
-                format!(
-                    ">{}.{} {}:{}-{} {}\n{}",
-                    species,
-                    chrom,
-                    chrom,
-                    seq.start,
-                    seq.start + seq.size,
-                    strand,
-                    seq.text
-                )
-            })
-            .collect();
+    pub fn format_fasta(
+        &self,
+        species_dict: &SpeciesDictionary,
+        chrom: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let sequences = self.get_sequences()?;
+        let mut fasta_entries = Vec::new();
 
-        // Join all entries with newlines
-        fasta_entries.join("\n") + "\n"
+        for (meta, sequence) in self.sequence_metadata.iter().zip(sequences.iter()) {
+            let species = species_dict
+                .get_species(meta.species_idx)
+                .unwrap_or("unknown");
+            let strand = if meta.strand { "-" } else { "+" };
+
+            fasta_entries.push(format!(
+                ">{}.{} {}:{}-{} {}\n{}",
+                species,
+                chrom,
+                chrom,
+                meta.start,
+                meta.start + meta.size,
+                strand,
+                sequence
+            ));
+        }
+
+        Ok(fasta_entries.join("\n") + "\n")
     }
 
     /// Write the alignment blocks to a FASTA file.
@@ -229,77 +313,11 @@ impl MafBlock {
         let mut writer = OutputFile::new(path).writer()?;
 
         // Write the formatted FASTA string to the file
-        writeln!(writer, "{}", self.format_fasta(species_dict, chrom))?;
+        let fasta_string = self.format_fasta(species_dict, chrom)?;
+        writeln!(writer, "{}", fasta_string)?;
 
         Ok(())
     }
-}
-
-pub fn convert_to_binary(
-    input: &Path,
-    output_dir: &Path,
-    min_length: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let total_time = Instant::now();
-    let mut maf = MafReader::from_file(input)?;
-    let _header = maf.read_header()?;
-
-    // Create store with species dictionary
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::create(output_dir, None)?;
-
-    store.set_metadata(SpeciesDictionary::new());
-
-    while let Some(block) = maf.next_block()? {
-        if block.sequences[0].size < min_length {
-            continue;
-        }
-
-        let ref_seq = &block.sequences[0];
-        let chr = ref_seq.src.split('.').nth(1).ok_or("Invalid ref name")?;
-
-        // Convert sequences to metadata + alignment strings
-        let mut alignment_strings = Vec::new();
-
-        for seq in &block.sequences {
-            let species = seq.src.split('.').next().unwrap_or("unknown").to_string();
-            // Get mutable reference to metadata and update species dictionary
-            let species_idx = if let Some(metadata) = store.metadata_mut() {
-                metadata.get_or_insert(species)
-            } else {
-                // This shouldn't happen since we initialized with Some metadata
-                return Err("Missing metadata".into());
-            };
-
-            alignment_strings.push(AlignedSequence {
-                species_idx,
-                start: seq.start as u32,
-                size: seq.size as u32,
-                strand: matches!(seq.strand, Strand::Reverse),
-                src_size: seq.src_size as u32,
-                text: seq.text.clone(),
-            });
-        }
-
-        let score = block.score.unwrap_or(0.0) as f32;
-
-        let record = MafBlock {
-            score,
-            sequences: alignment_strings,
-        };
-
-        store.add_record(
-            chr,
-            ref_seq.start as u32,
-            (ref_seq.start + ref_seq.size) as u32,
-            &record,
-        )?;
-    }
-
-    // Finalize the store
-    store.finalize()?;
-
-    info!("Total elapsed {:?}", total_time.elapsed());
-    Ok(())
 }
 
 pub fn query_alignments(
@@ -311,7 +329,7 @@ pub fn query_alignments(
 ) -> Result<(Vec<MafBlock>, SpeciesDictionary), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
-    let mut blocks: Vec<MafBlock> = store.get_overlapping(chrom, start, end);
+    let mut blocks: Vec<MafBlock> = store.get_overlapping(chrom, start, end)?;
     let query_time = total_time.elapsed();
 
     // Get the store's metadata for species names
@@ -322,8 +340,11 @@ pub fn query_alignments(
         let mut common_species: Option<HashSet<u32>> = None;
 
         for block in &blocks {
-            let block_species: HashSet<u32> =
-                block.sequences.iter().map(|seq| seq.species_idx).collect();
+            let block_species: HashSet<u32> = block
+                .sequence_metadata
+                .iter()
+                .map(|seq| seq.species_idx)
+                .collect();
 
             common_species = match common_species {
                 None => Some(block_species),
@@ -336,7 +357,7 @@ pub fn query_alignments(
                 .into_iter()
                 .map(|mut block| {
                     block
-                        .sequences
+                        .sequence_metadata
                         .retain(|seq| common_species.contains(&seq.species_idx));
                     block
                 })
@@ -536,7 +557,7 @@ pub fn stats_command(
         let end: u32 = record[2].parse()?;
 
         // Get overlapping blocks
-        let blocks: Vec<MafBlock> = store.get_overlapping(&chrom, start, end);
+        let blocks: Vec<MafBlock> = store.get_overlapping(&chrom, start, end)?;
 
         if blocks.is_empty() {
             continue;
@@ -561,6 +582,158 @@ pub fn stats_command(
     info!("Total elapsed {:?}", total_time.elapsed());
     Ok(())
 }
+
+/// Helper function to convert a block from MAF format to binary format
+fn convert_maf_block_to_binary(
+    block: &crate::io::AlignmentBlock,
+    store: &mut GenomicDataStore<MafBlock, SpeciesDictionary>,
+    min_length: u64,
+    compression_stats: &mut Option<&mut CompressionStats>,
+) -> Result<(), Box<dyn Error>> {
+    if block.sequences[0].size < min_length {
+        return Ok(());
+    }
+
+    let ref_seq = &block.sequences[0];
+    let chr = ref_seq.src.split('.').nth(1).ok_or("Invalid ref name")?;
+
+    // Convert sequences to metadata + alignment strings pairs
+    let mut sequences = Vec::new();
+
+    for seq in &block.sequences {
+        let species = seq.src.split('.').next().unwrap_or("unknown").to_string();
+        let species_idx = if let Some(metadata) = store.metadata_mut() {
+            metadata.get_or_insert(species)
+        } else {
+            return Err("Missing metadata".into());
+        };
+
+        sequences.push((
+            AlignedSequence {
+                species_idx,
+                start: seq.start as u32,
+                size: seq.size as u32,
+                strand: matches!(seq.strand, Strand::Reverse),
+                src_size: seq.src_size as u32,
+            },
+            seq.text.clone(),
+        ));
+    }
+
+    let score = block.score.unwrap_or(0.0) as f32;
+    let record = MafBlock::new(score, sequences)?;
+
+    // Sample compression ratio if requested
+    if let Some(stats) = compression_stats {
+        stats.add_ratio(record.compressed_text.compression_ratio());
+    }
+
+    store.add_record(chr, &record)?;
+
+    Ok(())
+}
+
+/// Stores compression statistics for reporting
+struct CompressionStats {
+    ratios: Vec<f64>,
+    sample_size: usize,
+    max_samples: usize,
+}
+
+impl CompressionStats {
+    fn new(max_samples: usize) -> Self {
+        Self {
+            ratios: Vec::with_capacity(max_samples),
+            sample_size: 0,
+            max_samples,
+        }
+    }
+
+    fn add_ratio(&mut self, ratio: f64) {
+        if self.sample_size < self.max_samples {
+            self.ratios.push(ratio);
+            self.sample_size += 1;
+        }
+    }
+
+    fn report(&self) {
+        if self.ratios.is_empty() {
+            info!("No compression ratios collected");
+            return;
+        }
+
+        let sum: f64 = self.ratios.iter().sum();
+        let avg = sum / self.ratios.len() as f64;
+        let min = self.ratios.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max = self.ratios.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+
+        info!(
+            "Compression Statistics (sample size: {}):",
+            self.sample_size
+        );
+        info!("  Average ratio: {:.2}%", avg * 100.0);
+        info!("  Min ratio: {:.2}%", min * 100.0);
+        info!("  Max ratio: {:.2}%", max * 100.0);
+    }
+}
+
+/// Helper function to initialize the store and metadata
+fn init_store(
+    output_dir: &Path,
+) -> Result<GenomicDataStore<MafBlock, SpeciesDictionary>, Box<dyn Error>> {
+    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::create(output_dir, None)?;
+    store.set_metadata(SpeciesDictionary::new());
+    Ok(store)
+}
+
+/// Helper function to process a single MAF file
+fn process_maf_file(
+    input: &Path,
+    store: &mut GenomicDataStore<MafBlock, SpeciesDictionary>,
+    min_length: u64,
+    progress: Option<&ProgressBar>,
+    compression_stats: &mut Option<&mut CompressionStats>,
+) -> Result<(), Box<dyn Error>> {
+    let mut maf = MafReader::from_file(input)?;
+    let _header = maf.read_header()?;
+
+    while let Some(block) = maf.next_block()? {
+        convert_maf_block_to_binary(&block, store, min_length, compression_stats)?;
+    }
+
+    if let Some(pb) = progress {
+        pb.inc(1);
+    }
+
+    Ok(())
+}
+
+/// Convert a single MAF file to binary format
+pub fn convert_to_binary(
+    input: &Path,
+    output_dir: &Path,
+    min_length: u64,
+) -> Result<(), Box<dyn Error>> {
+    let total_time = Instant::now();
+
+    let mut store = init_store(output_dir)?;
+    let mut compression_stats = CompressionStats::new(1000); // Sample up to 1000 blocks
+    process_maf_file(
+        input,
+        &mut store,
+        min_length,
+        None,
+        &mut Some(&mut compression_stats),
+    )?;
+    store.finalize()?;
+
+    compression_stats.report();
+    compression_stats.report();
+    info!("Total elapsed {:?}", total_time.elapsed());
+    Ok(())
+}
+
+/// Convert multiple MAF files matching a glob pattern to binary format
 pub fn convert_to_binary_glob(
     input_pattern: &str,
     output_dir: &Path,
@@ -568,12 +741,7 @@ pub fn convert_to_binary_glob(
 ) -> Result<(), Box<dyn Error>> {
     let total_time = Instant::now();
 
-    // Create progress bar
-    let style = ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({msg})")?
-        .progress_chars("=>-");
-
-    // Collect all matching files
+    // Collect and sort input files
     let mut input_files: Vec<PathBuf> = glob(input_pattern)?.filter_map(Result::ok).collect();
 
     if input_files.is_empty() {
@@ -581,16 +749,22 @@ pub fn convert_to_binary_glob(
         return Ok(());
     }
 
+    input_files.sort();
     info!("Found {} files to process", input_files.len());
-    input_files.sort(); // Sort for consistent processing
 
-    // Create store with species dictionary
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::create(output_dir, None)?;
-    store.set_metadata(SpeciesDictionary::new());
-
-    // Setup progress bar
+    // Setup progress tracking
     let progress = ProgressBar::new(input_files.len() as u64);
-    progress.set_style(style);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({msg})",
+            )?
+            .progress_chars("=>-"),
+    );
+
+    // Initialize store
+    let mut store = init_store(output_dir)?;
+    let mut compression_stats = CompressionStats::new(1000); // Sample up to 1000 blocks
 
     // Process each file
     for input_file in input_files {
@@ -600,57 +774,16 @@ pub fn convert_to_binary_glob(
             .unwrap_or("unknown");
         progress.set_message(format!("Processing {}", file_name));
 
-        let mut maf = MafReader::from_file(&input_file)?;
-        let _header = maf.read_header()?;
-
-        while let Some(block) = maf.next_block()? {
-            if block.sequences[0].size < min_length {
-                continue;
-            }
-
-            let ref_seq = &block.sequences[0];
-            let chr = ref_seq.src.split('.').nth(1).ok_or("Invalid ref name")?;
-
-            // Convert sequences to metadata + alignment strings
-            let mut alignment_strings = Vec::new();
-
-            for seq in &block.sequences {
-                let species = seq.src.split('.').next().unwrap_or("unknown").to_string();
-
-                // Get mutable reference to metadata and update species dictionary
-                let species_idx = if let Some(metadata) = store.metadata_mut() {
-                    metadata.get_or_insert(species)
-                } else {
-                    return Err("Missing metadata".into());
-                };
-
-                alignment_strings.push(AlignedSequence {
-                    species_idx,
-                    start: seq.start as u32,
-                    size: seq.size as u32,
-                    strand: matches!(seq.strand, Strand::Reverse),
-                    src_size: seq.src_size as u32,
-                    text: seq.text.clone(),
-                });
-            }
-
-            let score = block.score.unwrap_or(0.0) as f32;
-            let record = MafBlock {
-                score,
-                sequences: alignment_strings,
-            };
-
-            store.add_record(
-                chr,
-                ref_seq.start as u32,
-                (ref_seq.start + ref_seq.size) as u32,
-                &record,
-            )?;
-        }
-        progress.inc(1);
+        process_maf_file(
+            &input_file,
+            &mut store,
+            min_length,
+            Some(&progress),
+            &mut Some(&mut compression_stats),
+        )?;
     }
 
-    // Finalize and clean up
+    // Finalize and cleanup
     progress.finish_with_message("Processing complete");
     store.finalize()?;
 

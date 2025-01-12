@@ -355,9 +355,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let focal_species = if all_pairwise {
                         None
                     } else {
-                        // the first sequence in the block is always the reference,
-                        // and thus from the reference source/species.
-                        let idx = block.sequences[0].species_idx;
+                        // the first sequence in the block is always the reference
+                        let idx = block.sequence_metadata[0].species_idx;
                         Some(species_dict.get_species(idx).unwrap())
                     };
 
