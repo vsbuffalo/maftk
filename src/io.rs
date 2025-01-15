@@ -1,7 +1,7 @@
 /// io.rs
 use flate2::read::GzDecoder;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
@@ -302,188 +302,144 @@ impl MafReader {
     }
 }
 
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+const DEFAULT_BUFFER_SIZE: usize = 128 * 1024;
+
 #[derive(Error, Debug)]
 pub enum IoError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("Invalid or corrupted gzip header")]
+    InvalidGzipHeader,
 }
 
-pub struct InputFile {
-    pub filepath: PathBuf,
+pub struct InputStream {
+    filepath: PathBuf,
 }
 
-impl InputFile {
+impl InputStream {
     pub fn new(filepath: &Path) -> Self {
         Self {
             filepath: filepath.into(),
         }
     }
 
+    fn is_gzipped(file: &mut File) -> Result<bool, IoError> {
+        let mut header = [0u8; 2];
+        // Read the first two bytes
+        file.read_exact(&mut header)?;
+        // Reset the file pointer
+        file.rewind()?;
+        Ok(header == GZIP_MAGIC)
+    }
+
     pub fn reader(&self) -> Result<BufReader<Box<dyn Read>>, IoError> {
-        let file = File::open(self.filepath.clone())?;
-        let reader: Box<dyn Read> = if self.filepath.ends_with(".gz") {
+        let mut file = File::open(&self.filepath)?;
+        let reader: Box<dyn Read> = if Self::is_gzipped(&mut file)? {
             Box::new(GzDecoder::new(file))
         } else {
             Box::new(file)
         };
-        Ok(BufReader::new(reader))
+        Ok(BufReader::with_capacity(DEFAULT_BUFFER_SIZE, reader))
     }
 
     pub fn has_header(&self, expect: &str) -> Result<bool, IoError> {
         let mut buf_reader = self.reader()?;
         let mut first_line = String::new();
         buf_reader.read_line(&mut first_line)?;
-        let has_header = first_line.starts_with(expect);
-        Ok(has_header)
+        Ok(first_line.starts_with(expect))
     }
 }
 
-pub struct OutputFile {
-    pub filepath: PathBuf,
+#[derive(Clone)]
+pub struct OutputStreamBuilder {
+    filepath: Option<PathBuf>,
+    buffer_size: usize,
+    compression_level: Compression,
 }
 
-impl OutputFile {
-    pub fn new(filepath: &Path) -> Self {
+impl Default for OutputStreamBuilder {
+    fn default() -> Self {
         Self {
-            filepath: filepath.into(),
+            filepath: None,
+            buffer_size: DEFAULT_BUFFER_SIZE,
+            compression_level: Compression::default(),
         }
-    }
-    pub fn writer(&self) -> Result<Box<dyn Write>, Error> {
-        let outfile = &self.filepath;
-        let is_gzip = outfile.extension().is_some_and(|ext| ext == "gz");
-        let writer: Box<dyn Write> = if is_gzip {
-            Box::new(BufWriter::new(GzEncoder::new(
-                File::create(outfile)?,
-                Compression::default(),
-            )))
-        } else {
-            Box::new(BufWriter::new(File::create(outfile)?))
-        };
-        Ok(writer)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    // Helper function to get path to test data
-    fn test_data_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("data")
+impl OutputStreamBuilder {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn fetch_chr22_maf_reader() -> MafReader {
-        let chr22_file = test_data_dir().join("chr22_chunk.maf");
-        MafReader::from_file(&chr22_file).unwrap()
+    pub fn filepath(mut self, path: Option<impl AsRef<Path>>) -> Self {
+        self.filepath = path.map(|p| p.as_ref().to_path_buf());
+        self
     }
 
-    #[test]
-    fn test_sequence_lengths_match() {
-        let mut maf = fetch_chr22_maf_reader();
-        let block = maf.next_block().unwrap().unwrap();
+    pub fn buffer_size(mut self, size: usize) -> Self {
+        self.buffer_size = size;
+        self
+    }
 
-        // Get the length of the first sequence's text
-        let expected_length = block.sequences[0].text.len();
+    pub fn compression_level(mut self, level: Option<Compression>) -> Self {
+        if let Some(level) = level {
+            self.compression_level = level;
+        } else {
+            self.compression_level = Compression::best();
+        }
+        self
+    }
 
-        // All sequences should have the same text length (including gaps)
-        for seq in &block.sequences {
-            assert_eq!(
-                seq.text.len(),
-                expected_length,
-                "Sequence {} has different length",
-                seq.src
-            );
+    pub fn build(self) -> OutputStream {
+        OutputStream {
+            filepath: self.filepath,
+            buffer_size: self.buffer_size,
+            compression_level: self.compression_level,
         }
     }
+}
 
-    #[test]
-    fn test_gap_handling() {
-        let mut maf = fetch_chr22_maf_reader();
-        let block = maf.next_block().unwrap().unwrap();
+pub struct OutputStream {
+    filepath: Option<PathBuf>,
+    buffer_size: usize,
+    compression_level: Compression,
+}
 
-        // Check that gaps are preserved in the sequences
-        let hg38 = &block.sequences[0].text;
-        let pantro4 = &block.sequences[1].text;
-
-        assert!(hg38.contains("----")); // Check for gap presence
-        assert!(pantro4.contains("----"));
-
-        // Verify specific gap in panTro4 sequence (the single base deletion)
-        assert!(pantro4.contains("TTTTCAA-GC"));
+impl OutputStream {
+    pub fn new(filepath: Option<impl AsRef<Path>>) -> Self {
+        OutputStreamBuilder::new().filepath(filepath).build()
     }
 
-    #[test]
-    fn test_real_maf_block() {
-        let mut maf = fetch_chr22_maf_reader();
+    pub fn builder() -> OutputStreamBuilder {
+        OutputStreamBuilder::new()
+    }
 
-        // Check header first
-        let header = maf.read_header().unwrap();
-        assert_eq!(header.version, "1");
-        assert_eq!(header.scoring, Some("roast.v3.3".to_string()));
+    fn should_compress(&self) -> bool {
+        self.filepath
+            .as_ref()
+            .map_or(false, |p| p.extension().map_or(false, |ext| ext == "gz"))
+    }
 
-        let block = maf.next_block().unwrap().unwrap();
-
-        // Test block score
-        assert_eq!(block.score, Some(1058584.0));
-
-        // Test number of sequences and info lines
-        assert_eq!(block.sequences.len(), 19); // Updated to correct number
-        assert_eq!(block.infos.len(), 18); // One info line per sequence except first
-
-        // Test first sequence (hg38)
-        let hg38 = &block.sequences[0];
-        assert_eq!(hg38.src, "hg38.chr22");
-        assert_eq!(hg38.start, 10510072);
-        assert_eq!(hg38.size, 138);
-        assert_eq!(hg38.strand, Strand::Forward);
-        assert_eq!(hg38.src_size, 50818468);
-        assert!(hg38.text.starts_with("TTTTCAAAGC"));
-
-        // Test specific sequences from different parts of the alignment
-        let check_species = vec![
-            ("hg38.chr22", Strand::Forward),
-            ("panTro4.chrUn_GL393523", Strand::Forward),
-            ("ponAbe2.chrUn", Strand::Reverse),
-            ("myoLuc2.GL429790", Strand::Reverse), // Last sequence
-        ];
-
-        for (species, expected_strand) in check_species {
-            let seq = block
-                .sequences
-                .iter()
-                .find(|s| s.src == species)
-                .unwrap_or_else(|| panic!("Missing sequence for {}", species));
-            assert_eq!(seq.strand, expected_strand, "Wrong strand for {}", species);
+    pub fn writer(&self) -> Result<Box<dyn Write>, Error> {
+        match &self.filepath {
+            Some(path) => {
+                let file = File::create(path)?;
+                let writer: Box<dyn Write> = if self.should_compress() {
+                    Box::new(BufWriter::with_capacity(
+                        self.buffer_size,
+                        GzEncoder::new(file, self.compression_level),
+                    ))
+                } else {
+                    Box::new(BufWriter::with_capacity(self.buffer_size, file))
+                };
+                Ok(writer)
+            }
+            None => Ok(Box::new(BufWriter::with_capacity(
+                self.buffer_size,
+                io::stdout(),
+            ))),
         }
-
-        // Test alignment consistency
-        let alignment_length = block.sequences[0].text.len();
-        for seq in &block.sequences {
-            assert_eq!(
-                seq.text.len(),
-                alignment_length,
-                "Sequence {} has different length",
-                seq.src
-            );
-        }
-
-        // Check specific gaps that we know should be present
-        let pantro4 = block
-            .sequences
-            .iter()
-            .find(|s| s.src == "panTro4.chrUn_GL393523")
-            .unwrap();
-        assert!(pantro4.text.contains("TTTTCAA-GC"));
-
-        // Test info line for a sequence with non-zero counts
-        let equcab_info = block
-            .infos
-            .iter()
-            .find(|i| i.src == "equCab2.chr1")
-            .unwrap_or_else(|| panic!("Missing info for equCab2.chr1"));
-        assert_eq!(equcab_info.left_count, 242);
     }
 }

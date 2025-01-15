@@ -5,8 +5,8 @@ use maftk::binary::{
     calc_block_statistics, convert_to_binary, convert_to_binary_glob, print_alignments,
     print_block_statistics, query_alignments,
 };
-use maftk::binary::{stats_command, SpeciesDictionary};
-use maftk::io::{MafReader, OutputFile};
+use maftk::binary::{stats_command_range, stats_command_ranges, SpeciesDictionary};
+use maftk::io::{MafReader, OutputStream};
 use polars::io::csv::write::CsvWriter;
 use polars::io::SerWriter;
 use std::collections::HashSet;
@@ -59,20 +59,12 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         min_length: u64,
     },
-    /// Get alignments at a specific position or range, and either write to a directory (one FASTA
+    /// Get alignments at a specific position or region, and either write to a directory (one FASTA
     /// file per alignment) or print alignments.
     Query {
-        /// Chromosome name (e.g., chr22)
-        #[arg(value_name = "chromosome")]
-        chromosome: String,
-
-        /// Start position (1-based)
-        #[arg(value_name = "start")]
-        start: u32,
-
-        /// End position (optional, defaults to start+1)
-        #[arg(value_name = "end")]
-        end: Option<u32>,
+        /// Single genomic region in format chr:start-end (1-based coordinates)
+        #[arg(value_name = "chr17:7661779-7687538")]
+        region: String,
 
         /// Directory containing binary MAF files
         #[arg(short, long, default_value = "maf.mmdb")]
@@ -103,15 +95,32 @@ enum Commands {
         all_pairwise: bool,
     },
     /// Calculate an alignment statistics table for all alignments
-    /// in the supplied BED file.
+    /// in the supplied BED file. Note that each entry is from
+    /// *one* block; merging blocks will not automatically be combined,
+    /// since this can be done downstream on the default output (counts only
+    /// data, e.g. without --include-rates). Do not merge rates in post-processsing
+    /// with --include-rates unless you know how to do this correctly.
     Stats {
-        /// Input BED3 file
-        #[arg(value_name = "regions.bed")]
-        regions: PathBuf,
+        /// Single genomic region in format chr:start-end (1-based coordinates)
+        #[arg(
+            value_name = "chr17:7661779-7687538",
+            required_unless_present_any = ["regions"],
+            conflicts_with_all = ["regions"]
+        )]
+        region: Option<String>,
+
+        /// Input BED file for batch region queries
+        #[arg(
+            long,
+            value_name = "regions.bed",
+            required_unless_present_any = ["region"],
+            conflicts_with_all = ["region"]
+        )]
+        regions: Option<PathBuf>,
 
         /// Output TSV file
         #[arg(short, long, value_name = "output.tsv.gz")]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// Comma-separated list of species.
         #[arg(short, long, value_name = "hg38,panTro4,ponAbe2")]
@@ -120,6 +129,10 @@ enum Commands {
         /// Directory containing binary MAF files
         #[arg(short, long, default_value = "maf.mmdb")]
         data_dir: PathBuf,
+
+        /// Whether to include rates.
+        #[arg(long)]
+        include_rates: bool,
     },
 
     /// Debug an index file's structure
@@ -201,7 +214,7 @@ fn write_block(file: &mut File, block: &maftk::io::AlignmentBlock) -> std::io::R
     writeln!(file) // Extra newline between blocks
 }
 
-fn get_block_range(block: &maftk::io::AlignmentBlock) -> Option<(String, u64, u64)> {
+fn get_block_region(block: &maftk::io::AlignmentBlock) -> Option<(String, u64, u64)> {
     // Get the first sequence in the block
     let first_seq = block.sequences.first()?;
 
@@ -243,7 +256,7 @@ fn split_maf(
             continue;
         }
 
-        if let Some((chr, start, end)) = get_block_range(&block) {
+        if let Some((chr, start, end)) = get_block_region(&block) {
             let filename = format!("{}_{}_{}.maf", chr, start, end);
             let filepath = output_dir.join(&filename);
 
@@ -330,9 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Commands::Query {
-            chromosome,
-            start,
-            end,
+            region,
             data_dir,
             output_dir,
             no_color,
@@ -340,15 +351,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats,
             all_pairwise,
         } => {
-            let end = end.unwrap_or(start + 1);
-            if end <= start {
-                eprintln!("End position must be greater than start position");
-                std::process::exit(1);
-            }
+            let (chromosome, start, end) = parse_range(&region)?;
 
             // Get the overlapping alignment blocks
             let (blocks, species_dict) =
-                query_alignments(&data_dir, &chromosome, start, end, intersect_only)?;
+                query_alignments(&data_dir, chromosome, start, end, intersect_only)?;
 
             if stats {
                 for (i, block) in blocks.iter().enumerate() {
@@ -366,8 +373,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             create_dir_all(dir)?;
                             let filepath = format!("block_{}.tsv.gz", i);
                             let path = dir.join(&filepath);
-                            let writer = OutputFile::new(&path).writer()?;
-                            CsvWriter::new(writer)
+                            let writer = OutputStream::builder()
+                                .filepath(Some(path))
+                                .compression_level(None)
+                                .build();
+                            CsvWriter::new(writer.writer()?)
                                 .include_header(true)
                                 .with_separator(b'\t')
                                 .finish(&mut df)?;
@@ -383,7 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for (i, block) in blocks.iter().enumerate() {
                     let filepath = format!("block_{}.fa.gz", i);
                     let path = dir.join(&filepath);
-                    block.write_fasta(&path, &species_dict, &chromosome)?;
+                    block.write_fasta(Some(&path), &species_dict, chromosome)?;
                 }
             } else {
                 // We print to screen rather than write to FASTA directory.
@@ -391,13 +401,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Stats {
+            region,
             regions,
             output,
             species,
             data_dir,
+            include_rates,
         } => {
             let species = HashSet::from_iter(species.split(',').map(String::from));
-            stats_command(&regions, &output, species, &data_dir)?
+
+            if let Some(region_str) = region {
+                // Handle single range case
+                let (seqname, start, end) = parse_range(&region_str)?;
+                stats_command_range(
+                    seqname,
+                    start,
+                    end,
+                    output.as_deref(),
+                    species,
+                    &data_dir,
+                    include_rates,
+                )?;
+            } else if let Some(ranges_path) = regions {
+                // Handle multiple regions from BED file
+                stats_command_ranges(
+                    &ranges_path,
+                    output.as_deref(),
+                    species,
+                    &data_dir,
+                    include_rates,
+                )?;
+            } else {
+                panic!("Invalid options");
+            }
         }
         Commands::DebugIndex { path } => {
             let _index = BinningIndex::<SpeciesDictionary>::open(&path)?;
@@ -406,4 +442,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+// Also converts from user-space 1-based right inclusive to coder space
+// 0-based right exclusive interval format.
+fn parse_range(range: &str) -> Result<(&str, u32, u32), Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = range.split(':').collect();
+    if parts.len() != 2 {
+        return Err("Invalid range format. Expected seqname:start-end.".into());
+    }
+
+    let seqname = parts[0];
+    let coords: Vec<&str> = parts[1].split('-').collect();
+    if coords.len() != 2 {
+        return Err("Invalid range format. Expected start-end.".into());
+    }
+
+    let start: u32 = coords[0].parse().map_err(|_| "Invalid start coordinate.")?;
+    let end: u32 = coords[1].parse().map_err(|_| "Invalid end coordinate.")?;
+
+    // Convert to 0-based coordinates like in the query command
+    let start = start
+        .checked_sub(1)
+        .ok_or("Start coordinate must be greater than 0")?;
+
+    Ok((seqname, start, end))
 }

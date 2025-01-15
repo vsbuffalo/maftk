@@ -6,7 +6,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::binary::{MafBlock, SpeciesDictionary};
-use crate::io::OutputFile;
+use crate::io::OutputStream;
 
 #[derive(Error, Debug)]
 pub enum StatsError {
@@ -95,15 +95,24 @@ impl std::fmt::Display for RegionStats {
 pub struct AlignmentStatistics {
     writer: Writer<Box<dyn Write>>,
     species: HashSet<String>,
+    include_rates: bool,
 }
 
 impl AlignmentStatistics {
-    pub fn new(output: OutputFile, species: HashSet<String>) -> Result<Self, StatsError> {
+    pub fn new(
+        output: OutputStream,
+        species: HashSet<String>,
+        output_fracs: bool,
+    ) -> Result<Self, StatsError> {
         let writer = WriterBuilder::new()
             .delimiter(b'\t')
             .from_writer(output.writer()?);
 
-        let mut stats = Self { writer, species };
+        let mut stats = Self {
+            writer,
+            species,
+            include_rates: output_fracs,
+        };
         stats.write_header()?;
         Ok(stats)
     }
@@ -128,8 +137,10 @@ impl AlignmentStatistics {
                 // NOTE: this must match the order exactly as in
                 // write_stats.
                 let species_label = format!("{}_{}", species_a, species_b);
-                headers.push(format!("{}_subst_rate", species_label));
-                headers.push(format!("{}_gap_rate", species_label));
+                if self.include_rates {
+                    headers.push(format!("{}_subst_rate", species_label));
+                    headers.push(format!("{}_gap_rate", species_label));
+                }
                 headers.push(format!("{}_num_subst", species_label));
                 headers.push(format!("{}_num_single_gaps", species_label));
                 headers.push(format!("{}_num_double_gaps", species_label));
@@ -183,8 +194,10 @@ impl AlignmentStatistics {
                 // NOTE: this must match exactly as in write_header.
                 match stats.pairwise_stats.get(&pair) {
                     Some(pair_stats) => {
-                        record.push(pair_stats.substitution_rate().to_string());
-                        record.push(pair_stats.gap_rate().to_string());
+                        if self.include_rates {
+                            record.push(pair_stats.substitution_rate().to_string());
+                            record.push(pair_stats.gap_rate().to_string());
+                        }
                         record.push(pair_stats.substitutions.to_string());
                         record.push(pair_stats.single_gaps.to_string());
                         record.push(pair_stats.double_gaps.to_string());
@@ -192,8 +205,10 @@ impl AlignmentStatistics {
                         record.push(pair_stats.total_positions.to_string());
                     }
                     None => {
-                        record.push("NA".to_string());
-                        record.push("NA".to_string());
+                        if self.include_rates {
+                            record.push("NA".to_string());
+                            record.push("NA".to_string());
+                        }
                         record.push("NA".to_string());
                         record.push("NA".to_string());
                         record.push("NA".to_string());
@@ -311,6 +326,7 @@ pub fn calc_alignment_block_statistics(
 
             let mut pair_stats = PairwiseStats::default();
 
+            // ensure the sequences have the same length
             assert_eq!(seq1_slice.len(), seq2_slice.len());
             pair_stats.total_positions = seq1_slice.len() as u32;
 

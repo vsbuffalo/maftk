@@ -1,7 +1,6 @@
 // binary.rs
 
 use colored::*;
-use core::panic;
 use csv::ReaderBuilder;
 use flate2::write::{DeflateDecoder, DeflateEncoder};
 use flate2::Compression;
@@ -20,7 +19,7 @@ use tracing::{info, warn};
 
 use hgindex::{GenomicCoordinates, GenomicDataStore};
 
-use crate::io::{InputFile, MafReader, OutputFile, Strand};
+use crate::io::{InputStream, MafReader, OutputStream, Strand};
 use crate::statistics::{
     calc_alignment_block_statistics, compare_bases, is_gap, AlignmentStatistics, RegionStats,
 };
@@ -64,7 +63,7 @@ impl SpeciesDictionary {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompressedText(Vec<u8>);
 
 impl CompressedText {
@@ -91,7 +90,7 @@ impl CompressedText {
 /// Note: this is somewhat like Sequence in io.rs, expect it is designed to be a type more
 /// optimized for binary serialization. In particular, the species (src in the lower structure) is
 /// now just a u32 index.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AlignedSequence {
     pub species_idx: u32, // Index into species dictionary
     pub start: u32,       // Start position in source sequence
@@ -101,7 +100,7 @@ pub struct AlignedSequence {
 }
 
 // Modified MafBlock to include metadata
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MafBlock {
     pub score: f32,
     pub sequence_metadata: Vec<AlignedSequence>,
@@ -306,11 +305,11 @@ impl MafBlock {
     /// Write the alignment blocks to a FASTA file.
     pub fn write_fasta(
         &self,
-        path: &Path,
+        path: Option<&Path>,
         species_dict: &SpeciesDictionary,
         chrom: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut writer = OutputFile::new(path).writer()?;
+        let mut writer = OutputStream::new(path).writer()?;
 
         // Write the formatted FASTA string to the file
         let fasta_string = self.format_fasta(species_dict, chrom)?;
@@ -329,48 +328,72 @@ pub fn query_alignments(
 ) -> Result<(Vec<MafBlock>, SpeciesDictionary), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
-    let mut blocks: Vec<MafBlock> = store.get_overlapping(chrom, start, end)?;
+    let mut blocks: Vec<MafBlock> = store.get_overlapping(chrom, start, end)?.to_vec();
     let query_time = total_time.elapsed();
 
     // Get the store's metadata for species names
     let species_dict = store.metadata().unwrap();
 
     if intersect_only {
-        // Filter blocks to only keep sequences that overlap in all blocks
-        let mut common_species: Option<HashSet<u32>> = None;
+        // Modify each block to only contain the intersecting region
+        blocks = blocks
+            .into_iter()
+            .filter_map(|block| {
+                let ref_seq = &block.sequence_metadata[0];
+                let block_start = ref_seq.start;
+                let block_end = block_start + ref_seq.size;
 
-        for block in &blocks {
-            let block_species: HashSet<u32> = block
-                .sequence_metadata
-                .iter()
-                .map(|seq| seq.species_idx)
-                .collect();
+                // Check if there's any overlap
+                if end <= block_start || start >= block_end {
+                    return None;
+                }
 
-            common_species = match common_species {
-                None => Some(block_species),
-                Some(species) => Some(&species & &block_species),
-            };
-        }
+                // Calculate overlap region
+                let overlap_start = start.max(block_start);
+                let overlap_end = end.min(block_end);
 
-        if let Some(common_species) = common_species {
-            blocks = blocks
-                .into_iter()
-                .map(|mut block| {
-                    block
-                        .sequence_metadata
-                        .retain(|seq| common_species.contains(&seq.species_idx));
-                    block
-                })
-                .collect();
-        }
+                // Calculate offset and length in the alignment
+                let start_offset = (overlap_start - block_start) as usize;
+                let length = (overlap_end - overlap_start) as usize;
+
+                // Get the sequences
+                let sequences = match block.get_sequences() {
+                    Ok(seqs) => seqs,
+                    Err(_) => return None,
+                };
+
+                // Trim each sequence to just the overlapping region
+                let mut trimmed_sequences = Vec::new();
+                for (meta, seq) in block.sequence_metadata.iter().zip(sequences.iter()) {
+                    let trimmed_text = &seq[start_offset..start_offset + length];
+
+                    // Calculate new size based on non-gap characters
+                    let new_size =
+                        trimmed_text.chars().filter(|&c| !is_gap(c as u8)).count() as u32;
+
+                    let new_meta = AlignedSequence {
+                        species_idx: meta.species_idx,
+                        start: overlap_start,
+                        size: new_size,
+                        strand: meta.strand,
+                        src_size: meta.src_size,
+                    };
+
+                    trimmed_sequences.push((new_meta, trimmed_text.to_string()));
+                }
+
+                // Create new block with trimmed sequences
+                MafBlock::new(block.score, trimmed_sequences).ok()
+            })
+            .collect();
     }
 
     info!(
-        "Query elapsed {:?}, {} overlapping alignment block{} found.",
+        "Query elapsed {:?}, {} overlapping alignment blocks found.",
         query_time,
         blocks.len(),
-        if blocks.len() > 1 { "s" } else { "" }
     );
+    info!("total *query* region length: {}", end - start + 1);
     Ok((blocks, species_dict.clone()))
 }
 
@@ -464,7 +487,9 @@ pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary,
         println!("{} Match", "A".green());
         println!("{} Mismatch", "A".red());
         println!("{} Indel", "-".yellow());
-        println!("Coordinates shown as: species start_position [strand]");
+        println!(
+            "Coordinates shown as: species start_position [strand] (positions 0-based indexing)"
+        );
     }
 }
 
@@ -474,7 +499,7 @@ fn estimate_record_count(path: &Path) -> Result<u64, Box<dyn std::error::Error>>
     let file_size = file.metadata()?.len();
 
     // Sample first few lines to get average line length
-    let input_file = InputFile::new(path);
+    let input_file = InputStream::new(path);
     let mut reader = input_file.reader()?;
     let mut buffer = String::new();
     let mut total_bytes = 0;
@@ -508,33 +533,20 @@ fn estimate_record_count(path: &Path) -> Result<u64, Box<dyn std::error::Error>>
     Ok(estimated_records)
 }
 
-pub fn stats_command(
-    regions: &Path,
-    output: &Path,
+pub fn stats_command_range(
+    seqname: &str,
+    start: u32,
+    end: u32,
+    output: Option<&Path>,
     species: HashSet<String>,
     data_dir: &Path,
+    include_rates: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
 
-    // Setup progress bar
-    let estimated_records = estimate_record_count(regions)?;
-    let progress = ProgressBar::new(estimated_records);
-    progress.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} records ({eta})")?
-        .progress_chars("=>-"));
-
-    // Setup input/output
-    let input_file = InputFile::new(regions);
-    let buf_reader = input_file.reader()?;
-    let output_file = OutputFile::new(output);
-    let mut stats_writer = AlignmentStatistics::new(output_file, species.clone())?;
-
-    // Create CSV reader for BED file
-    let mut reader = ReaderBuilder::new()
-        .comment(Some(b'#'))
-        .delimiter(b'\t')
-        .has_headers(false)
-        .from_reader(buf_reader);
+    // Setup output
+    let output_file = OutputStream::new(output);
+    let mut stats_writer = AlignmentStatistics::new(output_file, species.clone(), include_rates)?;
 
     // Open store and get species dictionary
     let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
@@ -549,36 +561,108 @@ pub fn stats_command(
         .filter_map(|name| species_dict.species_to_index.get(name).copied())
         .collect();
 
-    // Process each region
+    // Get overlapping blocks for the single range
+    let blocks: &[MafBlock] = store.get_overlapping(seqname, start, end)?;
+
+    info!(
+        "Found {} blocks in range {}:{}-{}",
+        blocks.len(),
+        seqname,
+        start,
+        end
+    );
+
+    // Process each block
+    for block in blocks {
+        if let Some(mut block_stats) =
+            block.calc_stats(Some(start), Some(end), Some(&species_indices))
+        {
+            block_stats.chrom = seqname.to_string();
+            stats_writer.write_stats(&block_stats, &species_dict, &block)?;
+        }
+    }
+
+    info!("Total elapsed {:?}", total_time.elapsed());
+    Ok(())
+}
+
+pub fn stats_command_ranges(
+    ranges_file: &Path,
+    output: Option<&Path>,
+    species: HashSet<String>,
+    data_dir: &Path,
+    include_rates: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total_time = Instant::now();
+
+    // Setup progress bar
+    let estimated_records = estimate_record_count(ranges_file)?;
+    let progress = ProgressBar::new(estimated_records);
+    progress.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ranges ({eta})")?
+        .progress_chars("=>-"));
+
+    // Setup input/output
+    let mut reader = ReaderBuilder::new()
+        .comment(Some(b'#'))
+        .delimiter(b'\t')
+        .has_headers(false)
+        .from_reader(File::open(ranges_file)?);
+
+    let output_file = OutputStream::new(output);
+    let mut stats_writer = AlignmentStatistics::new(output_file, species.clone(), include_rates)?;
+
+    // Open store and get species dictionary
+    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
+    let species_dict = store
+        .metadata()
+        .expect("Missing species dictionary")
+        .clone();
+
+    // Convert species names to indices
+    let species_indices: HashSet<u32> = species
+        .iter()
+        .filter_map(|name| species_dict.species_to_index.get(name).copied())
+        .collect();
+
+    let mut total_blocks = 0;
+
+    // Process each range from the file
     for result in reader.records() {
         let record = result?;
-        let chrom = record[0].to_string();
-        let start: u32 = record[1].parse()?;
-        let end: u32 = record[2].parse()?;
+        let chrom = record.get(0).ok_or("Missing chromosome")?;
+        let start: u32 = record
+            .get(1)
+            .ok_or("Missing start")?
+            .parse()
+            .map_err(|_| "Invalid start coordinate")?;
+        let end: u32 = record
+            .get(2)
+            .ok_or("Missing end")?
+            .parse()
+            .map_err(|_| "Invalid end coordinate")?;
 
         // Get overlapping blocks
-        let blocks: Vec<MafBlock> = store.get_overlapping(&chrom, start, end)?;
+        let blocks: &[MafBlock] = store.get_overlapping(chrom, start, end)?;
+        total_blocks += blocks.len();
 
-        if blocks.is_empty() {
-            continue;
-        }
-
-        // Process each block independently
+        // Process each block
         for block in blocks {
             if let Some(mut block_stats) =
                 block.calc_stats(Some(start), Some(end), Some(&species_indices))
             {
-                block_stats.chrom = chrom.clone(); // Set chromosome
+                block_stats.chrom = chrom.to_string();
                 stats_writer.write_stats(&block_stats, &species_dict, &block)?;
-            } else {
-                panic!("No statistics returned due to no overlaps: internal error.");
-            };
+            }
         }
 
         progress.inc(1);
     }
 
-    progress.finish_with_message("Processing complete");
+    progress.finish_with_message(format!(
+        "Processing complete. Found {} total blocks",
+        total_blocks
+    ));
     info!("Total elapsed {:?}", total_time.elapsed());
     Ok(())
 }
