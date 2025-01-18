@@ -17,7 +17,7 @@ use std::time::Instant;
 use std::{collections::HashSet, path::Path};
 use tracing::{info, warn};
 
-use hgindex::{GenomicCoordinates, GenomicDataStore};
+use hgindex::{GenomicDataStore, Record, RecordSlice};
 
 use crate::io::{InputStream, MafReader, OutputStream, Strand};
 use crate::statistics::{
@@ -108,7 +108,30 @@ pub struct MafBlock {
     sequence_length: usize,
 }
 
-impl GenomicCoordinates for MafBlock {
+impl MafBlock {
+    /// Get the reference alignment's (first alignment) start position.
+    pub fn start(&self) -> u32 {
+        self.sequence_metadata[0].start
+    }
+
+    /// Get the reference alignment's (first alignment) end position.
+    pub fn end(&self) -> u32 {
+        let ref_alignment = &self.sequence_metadata[0];
+        ref_alignment.start + ref_alignment.size
+    }
+}
+
+#[derive(Debug)]
+pub struct MafBlockSlice<'a> {
+    bytes: &'a [u8],
+    // Cache the coordinates like BedRecordSlice does
+    start: u32,
+    end: u32,
+}
+
+impl Record for MafBlock {
+    type Slice<'a> = MafBlockSlice<'a>;
+
     fn start(&self) -> u32 {
         let ref_seq = &self.sequence_metadata[0];
         ref_seq.start
@@ -117,6 +140,47 @@ impl GenomicCoordinates for MafBlock {
     fn end(&self) -> u32 {
         let ref_seq = &self.sequence_metadata[0];
         ref_seq.start + ref_seq.size
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("Failed to serialize MafBlock")
+    }
+}
+
+impl<'a> RecordSlice<'a> for MafBlockSlice<'a> {
+    type Owned = MafBlock;
+
+    fn start(&self) -> u32 {
+        // Just return cached start
+        self.start
+    }
+
+    fn end(&self) -> u32 {
+        // Just return cached end
+        self.end
+    }
+
+    fn from_bytes(bytes: &'a [u8]) -> Self {
+        // We need to deserialize just enough to get coordinates
+        // This only runs once when creating the slice
+        let block: MafBlock = bincode::deserialize(bytes).expect("Failed to deserialize MafBlock");
+
+        let ref_seq = &block.sequence_metadata[0];
+        let start = ref_seq.start;
+        let end = start + ref_seq.size;
+
+        Self { bytes, start, end }
+    }
+
+    fn to_owned(self) -> Self::Owned {
+        // Now we can just deserialize the full block
+        bincode::deserialize(self.bytes).expect("Failed to deserialize MafBlock")
+    }
+}
+
+impl From<MafBlockSlice<'_>> for MafBlock {
+    fn from(slice: MafBlockSlice<'_>) -> Self {
+        slice.to_owned()
     }
 }
 
@@ -327,12 +391,14 @@ pub fn query_alignments(
     intersect_only: bool,
 ) -> Result<(Vec<MafBlock>, SpeciesDictionary), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
+    let mut store = GenomicDataStore::<MafBlock>::open(data_dir, None)?;
     let mut blocks: Vec<MafBlock> = store.get_overlapping(chrom, start, end)?.to_vec();
     let query_time = total_time.elapsed();
 
     // Get the store's metadata for species names
-    let species_dict = store.metadata().unwrap();
+    let species_dict: SpeciesDictionary = store
+        .metadata()
+        .expect("Internal error: no species metadata found.");
 
     if intersect_only {
         // Modify each block to only contain the intersecting region
@@ -549,11 +615,10 @@ pub fn stats_command_range(
     let mut stats_writer = AlignmentStatistics::new(output_file, species.clone(), include_rates)?;
 
     // Open store and get species dictionary
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
+    let mut store = GenomicDataStore::<MafBlock>::open(data_dir, None)?;
     let species_dict = store
-        .metadata()
-        .expect("Missing species dictionary")
-        .clone();
+        .metadata::<SpeciesDictionary>()
+        .expect("Invaild metadata.");
 
     // Convert species names to indices
     let species_indices: HashSet<u32> = species
@@ -578,7 +643,7 @@ pub fn stats_command_range(
             block.calc_stats(Some(start), Some(end), Some(&species_indices))
         {
             block_stats.chrom = seqname.to_string();
-            stats_writer.write_stats(&block_stats, &species_dict, &block)?;
+            stats_writer.write_stats(&block_stats, &species_dict, block)?;
         }
     }
 
@@ -613,11 +678,10 @@ pub fn stats_command_ranges(
     let mut stats_writer = AlignmentStatistics::new(output_file, species.clone(), include_rates)?;
 
     // Open store and get species dictionary
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::open(data_dir, None)?;
+    let mut store = GenomicDataStore::<MafBlock>::open(data_dir, None)?;
     let species_dict = store
-        .metadata()
-        .expect("Missing species dictionary")
-        .clone();
+        .metadata::<SpeciesDictionary>()
+        .expect("Invaild metadata.");
 
     // Convert species names to indices
     let species_indices: HashSet<u32> = species
@@ -652,7 +716,7 @@ pub fn stats_command_ranges(
                 block.calc_stats(Some(start), Some(end), Some(&species_indices))
             {
                 block_stats.chrom = chrom.to_string();
-                stats_writer.write_stats(&block_stats, &species_dict, &block)?;
+                stats_writer.write_stats(&block_stats, &species_dict, block)?;
             }
         }
 
@@ -670,7 +734,8 @@ pub fn stats_command_ranges(
 /// Helper function to convert a block from MAF format to binary format
 fn convert_maf_block_to_binary(
     block: &crate::io::AlignmentBlock,
-    store: &mut GenomicDataStore<MafBlock, SpeciesDictionary>,
+    store: &mut GenomicDataStore<MafBlock>,
+    species_dict: &mut SpeciesDictionary,
     min_length: u64,
     compression_stats: &mut Option<&mut CompressionStats>,
 ) -> Result<(), Box<dyn Error>> {
@@ -686,11 +751,7 @@ fn convert_maf_block_to_binary(
 
     for seq in &block.sequences {
         let species = seq.src.split('.').next().unwrap_or("unknown").to_string();
-        let species_idx = if let Some(metadata) = store.metadata_mut() {
-            metadata.get_or_insert(species)
-        } else {
-            return Err("Missing metadata".into());
-        };
+        let species_idx = species_dict.get_or_insert(species);
 
         sequences.push((
             AlignedSequence {
@@ -762,18 +823,16 @@ impl CompressionStats {
 }
 
 /// Helper function to initialize the store and metadata
-fn init_store(
-    output_dir: &Path,
-) -> Result<GenomicDataStore<MafBlock, SpeciesDictionary>, Box<dyn Error>> {
-    let mut store = GenomicDataStore::<MafBlock, SpeciesDictionary>::create(output_dir, None)?;
-    store.set_metadata(SpeciesDictionary::new());
+fn init_store(output_dir: &Path) -> Result<GenomicDataStore<MafBlock>, Box<dyn Error>> {
+    let store = GenomicDataStore::<MafBlock>::create(output_dir, None)?;
     Ok(store)
 }
 
 /// Helper function to process a single MAF file
 fn process_maf_file(
     input: &Path,
-    store: &mut GenomicDataStore<MafBlock, SpeciesDictionary>,
+    store: &mut GenomicDataStore<MafBlock>,
+    species_dict: &mut SpeciesDictionary,
     min_length: u64,
     progress: Option<&ProgressBar>,
     compression_stats: &mut Option<&mut CompressionStats>,
@@ -782,7 +841,7 @@ fn process_maf_file(
     let _header = maf.read_header()?;
 
     while let Some(block) = maf.next_block()? {
-        convert_maf_block_to_binary(&block, store, min_length, compression_stats)?;
+        convert_maf_block_to_binary(&block, store, species_dict, min_length, compression_stats)?;
     }
 
     if let Some(pb) = progress {
@@ -802,14 +861,19 @@ pub fn convert_to_binary(
 
     let mut store = init_store(output_dir)?;
     let mut compression_stats = CompressionStats::new(1000); // Sample up to 1000 blocks
+
+    // Create a mapping between species names and indices
+    let mut species_dict = SpeciesDictionary::new();
+
     process_maf_file(
         input,
         &mut store,
+        &mut species_dict,
         min_length,
         None,
         &mut Some(&mut compression_stats),
     )?;
-    store.finalize()?;
+    store.finalize_with_metadata(&species_dict)?;
 
     compression_stats.report();
     compression_stats.report();
@@ -850,6 +914,10 @@ pub fn convert_to_binary_glob(
     let mut store = init_store(output_dir)?;
     let mut compression_stats = CompressionStats::new(1000); // Sample up to 1000 blocks
 
+    // Create a mapping between species names and indices
+    // TODO this will be a problem if we make downstream stuff parallel.
+    let mut species_dict = SpeciesDictionary::new();
+
     // Process each file
     for input_file in input_files {
         let file_name = input_file
@@ -861,6 +929,7 @@ pub fn convert_to_binary_glob(
         process_maf_file(
             &input_file,
             &mut store,
+            &mut species_dict,
             min_length,
             Some(&progress),
             &mut Some(&mut compression_stats),
@@ -869,7 +938,7 @@ pub fn convert_to_binary_glob(
 
     // Finalize and cleanup
     progress.finish_with_message("Processing complete");
-    store.finalize()?;
+    store.finalize_with_metadata(&species_dict)?;
 
     info!("Total elapsed {:?}", total_time.elapsed());
     Ok(())

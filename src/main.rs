@@ -5,7 +5,7 @@ use maftk::binary::{
     calc_block_statistics, convert_to_binary, convert_to_binary_glob, print_alignments,
     print_block_statistics, query_alignments,
 };
-use maftk::binary::{stats_command_range, stats_command_ranges, SpeciesDictionary};
+use maftk::binary::{stats_command_range, stats_command_ranges};
 use maftk::io::{MafReader, OutputStream};
 use polars::io::csv::write::CsvWriter;
 use polars::io::SerWriter;
@@ -436,7 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::DebugIndex { path } => {
-            let _index = BinningIndex::<SpeciesDictionary>::open(&path)?;
+            let _index = BinningIndex::open(&path)?;
             todo!()
         }
     }
