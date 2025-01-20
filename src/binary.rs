@@ -408,6 +408,10 @@ impl BlockCache {
         self.cache.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn get_or_insert(&mut self, block: &MafBlock) -> Result<&Vec<String>, Box<dyn Error>> {
         let key = (block.start(), block.end());
 
@@ -420,7 +424,7 @@ impl BlockCache {
             let sequences = block.get_sequences()?;
             let decompress_time = start.elapsed();
             self.total_time_saved += decompress_time; // Track time we'll save on future hits
-            self.cache.put(key.clone(), sequences);
+            self.cache.put(key, sequences);
             Ok(self.cache.get(&key).unwrap())
         }
     }
@@ -624,7 +628,7 @@ pub fn estimate_total_records(
 ) -> Result<u64, Box<dyn std::error::Error>> {
     // Get total compressed size upfront
     let total_size = std::fs::metadata(path)?.len();
-    
+
     let input_stream = InputStream::new(path);
     let mut reader = input_stream.buffered_reader()?;
     let mut compressed_pos = 0;
@@ -640,7 +644,7 @@ pub fn estimate_total_records(
             // Hit EOF - return actual count
             return Ok(valid_lines);
         }
-        
+
         // Track position in decompressed stream
         compressed_pos += bytes_read;
 
@@ -722,6 +726,7 @@ pub fn stats_command_ranges(
     data_dir: &Path,
     include_rates: bool,
     has_header: bool,
+    cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
 
@@ -732,7 +737,7 @@ pub fn stats_command_ranges(
     // let estimated_records = 500_000;
     let progress = ProgressBar::new(estimated_records as u64).with_style(
         ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue}⟩ {pos}/{len} ({percent}%) [{eta_precise}] ({per_sec})")?
+        .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue}⟩ {pos}/{len} ({percent}%) [{eta_precise}] Cache[{msg}] ({per_sec})")?
         .progress_chars("=> ")
         );
 
@@ -768,8 +773,14 @@ pub fn stats_command_ranges(
         .collect();
 
     // Add cache with reasonable size (e.g. 1000 blocks)
-    let mut block_cache = BlockCache::new(1000);
-    let mut block_chrom: Option<String> = None;
+    let mut block_cache = None;
+    let mut block_chrom: Option<String>;
+    if cache {
+        block_cache = Some(BlockCache::new(1000));
+        block_chrom = None;
+    } else {
+        block_chrom = None;
+    }
 
     let mut total_blocks = 0;
 
@@ -783,18 +794,22 @@ pub fn stats_command_ranges(
 
         let record = result?;
         let chrom = record.get(0).ok_or("Missing chromosome")?;
-        if let Some(ref mut cached_chrom) = block_chrom {
-            // check if we can clear buffer
-            if cached_chrom != chrom {
-                // we need to clear buffer and update chrom.
-                // dbg!("new chrom = {}, old chrom = {}", cached_chrom, chrom);
+        if cache {
+            if let Some(ref mut cached_chrom) = block_chrom {
+                // check if we can clear buffer
+                if cached_chrom != chrom {
+                    // we need to clear buffer and update chrom.
+                    // dbg!("new chrom = {}, old chrom = {}", cached_chrom, chrom);
+                    block_chrom = Some(chrom.to_string());
+                    if let Some(cache) = block_cache.as_mut() {
+                        cache.clear();
+                    }
+                }
+            } else {
+                // no chrom set, first entry
                 block_chrom = Some(chrom.to_string());
-                block_cache.clear();
-            }
-        } else {
-            // no chrom set, first entry
-            block_chrom = Some(chrom.to_string());
-        };
+            };
+        }
 
         // block_cache.print_stats();
 
@@ -824,14 +839,27 @@ pub fn stats_command_ranges(
                 Some(start),
                 Some(end),
                 Some(&species_indices),
-                Some(&mut block_cache),
+                block_cache.as_mut(),
             ) {
                 block_stats.chrom = chrom.to_string();
                 stats_writer.write_stats(&block_stats, &species_dict, block)?;
             }
         }
 
-        progress.inc(1);
+        // Then in your loop, update message with cache stats
+        if i % 1000 == 0 {
+            // Maybe update less frequently
+            if let Some(cache) = block_cache.as_ref() {
+                let hit_rate = cache.hits as f64 / (cache.hits + cache.misses) as f64;
+                progress.set_message(format!(
+                    "hits={} misses={} rate={:.1}%",
+                    cache.hits,
+                    cache.misses,
+                    hit_rate * 100.0
+                ));
+            }
+            progress.set_position(i as u64);
+        }
     }
 
     progress.finish_with_message(format!(

@@ -138,6 +138,10 @@ enum Commands {
         /// doesn't start with '#'.
         #[arg(long)]
         has_header: bool,
+
+        /// Whether to disnable LRU cache of uncompressed sequences.
+        #[arg(long)]
+        dont_cache: bool,
     },
 
     /// Debug an index file's structure
@@ -413,6 +417,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_dir,
             include_rates,
             has_header,
+            dont_cache,
         } => {
             let species = HashSet::from_iter(species.split(',').map(String::from));
 
@@ -437,6 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &data_dir,
                     include_rates,
                     has_header,
+                    !dont_cache,
                 )?;
             } else {
                 panic!("Invalid options");

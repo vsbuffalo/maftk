@@ -549,7 +549,7 @@ mod tests {
         let block = create_test_block("ATCGatcg", "atcgATCG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats = block
-            .calc_stats(None, None, Some(&species_indices))
+            .calc_stats(None, None, Some(&species_indices), None)
             .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
@@ -565,7 +565,7 @@ mod tests {
         let block = create_test_block("A-ccG", "AtC-g");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats = block
-            .calc_stats(None, None, Some(&species_indices))
+            .calc_stats(None, None, Some(&species_indices), None)
             .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
