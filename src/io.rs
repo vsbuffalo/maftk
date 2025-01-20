@@ -419,7 +419,7 @@ impl OutputStream {
     fn should_compress(&self) -> bool {
         self.filepath
             .as_ref()
-            .map_or(false, |p| p.extension().map_or(false, |ext| ext == "gz"))
+            .is_some_and(|p| p.extension().is_some_and(|ext| ext == "gz"))
     }
 
     pub fn writer(&self) -> Result<Box<dyn Write>, Error> {

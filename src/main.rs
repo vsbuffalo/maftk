@@ -458,8 +458,12 @@ fn parse_range(range: &str) -> Result<(&str, u32, u32), Box<dyn std::error::Erro
         return Err("Invalid range format. Expected start-end.".into());
     }
 
-    let start: u32 = coords[0].parse().map_err(|_| "Invalid start coordinate.")?;
-    let end: u32 = coords[1].parse().map_err(|_| "Invalid end coordinate.")?;
+    let start: u32 = coords[0]
+        .parse()
+        .map_err(|e| format!("Invalid start coordinate (erorr kind: {}).", e))?;
+    let end: u32 = coords[1]
+        .parse()
+        .map_err(|e| format!("Invalid end coordinate (erorr kind: {}).", e))?;
 
     // Convert to 0-based coordinates like in the query command
     let start = start

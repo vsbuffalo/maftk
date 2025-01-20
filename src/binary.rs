@@ -669,7 +669,7 @@ pub fn stats_command_ranges(
 
     // Setup input/output
     // Use InputStream to handle compressed in put.
-    let input_stream = InputStream::new(&ranges_file);
+    let input_stream = InputStream::new(ranges_file);
     let stream = input_stream.reader()?;
 
     // Box the BufReader directly as a Read trait object
