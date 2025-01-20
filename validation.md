@@ -169,3 +169,45 @@ i chlSab2.chr2        C 0 C 0
 ```
 
 
+## Validation 3
+
+I've annotated the output below and split up stats columns onto multiple lines for clarity.
+
+```
+vsb@ponderosa /space/s1/vsb/projects/human_bgs/data/hg38/subrates main*
+base ❯ maftk query chr1:10918-10986 --intersect-only
+ INFO maftk::binary: Query elapsed 2.416644519s, 1 overlapping alignment blocks found.
+ INFO maftk::binary: total *query* region length: 70
+[block 0 | score 34237]
+                       0         10        20        30        40        50        60
+hg38            10917 + gagaggcgcaccgcgccggcgcaggcgcagagacacatgctagcgcgtccaggggtggaggcgtggcgc
+panTro4         10917 - gagaggcgcaccgcgccggcgcag------agacacatactagcgcgtcctgggg-ggaggtgcggcgc
+                                                              s           s          s s
+                                                xxxxxx                         x
+s: sub, x: gap
+
+Legend:
+A Match
+A Mismatch
+- Indel
+Coordinates shown as: species start_position [strand] (positions 0-based indexing)
+
+vsb@ponderosa /space/s1/vsb/projects/human_bgs/data/hg38/subrates main*
+base ❯ maftk stats chr1:10918-10986 --species hg38,panTro4
+ INFO maftk::binary: Found 1 blocks in range chr1:10917-10986
+ INFO maftk::binary: Total elapsed 2.409640852s
+chrom   start   end     
+chr1    10917   10986
+
+ref_aligned_start       ref_aligned_end 
+10917                   11396   
+
+hg38_panTro4_num_subst  hg38_panTro4_num_single_gaps    hg38_panTro4_num_double_gaps
+4                       7                               0    
+
+
+hg38_panTro4_valid_positions  hg38_panTro4_total_positions
+62                            69
+```
+
+SO this looks right.

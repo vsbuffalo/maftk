@@ -133,6 +133,11 @@ enum Commands {
         /// Whether to include rates.
         #[arg(long)]
         include_rates: bool,
+
+        /// Whether to skip first line (e.g. if it's a header that
+        /// doesn't start with '#'.
+        #[arg(long)]
+        has_header: bool,
     },
 
     /// Debug an index file's structure
@@ -407,6 +412,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             species,
             data_dir,
             include_rates,
+            has_header,
         } => {
             let species = HashSet::from_iter(species.split(',').map(String::from));
 
@@ -430,6 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     species,
                     &data_dir,
                     include_rates,
+                    has_header
                 )?;
             } else {
                 panic!("Invalid options");

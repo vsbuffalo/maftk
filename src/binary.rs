@@ -657,6 +657,7 @@ pub fn stats_command_ranges(
     species: HashSet<String>,
     data_dir: &Path,
     include_rates: bool,
+    has_header: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_time = Instant::now();
 
@@ -699,19 +700,22 @@ pub fn stats_command_ranges(
     let mut total_blocks = 0;
 
     // Process each range from the file
-    for result in reader.records() {
+    for (i, result) in reader.records().enumerate() {
+        if i == 0 && has_header {
+            // skip header -- back compatibility with data that 
+            // I forgot to put # on.
+            continue;
+        }
         let record = result?;
         let chrom = record.get(0).ok_or("Missing chromosome")?;
-        let start: u32 = record
-            .get(1)
-            .ok_or("Missing start")?
-            .parse()
-            .map_err(|_| "Invalid start coordinate")?;
-        let end: u32 = record
-            .get(2)
-            .ok_or("Missing end")?
-            .parse()
-            .map_err(|_| "Invalid end coordinate")?;
+        let start = record.get(1).ok_or("Missing start coordinate")
+            .map_err(|e| format!("Invalid start coordinate (erorr kind: {}).", e))?
+            .parse()?;
+        let end: u32 = record.get(2).ok_or("Missing end coordinate")
+            .map_err(|e| format!("Invalid end coordinate (erorr kind: {}).", e))?
+            .parse()?;
+
+
 
         // Get overlapping blocks
         let blocks: &[MafBlock] = store.get_overlapping(chrom, start, end)?;
@@ -721,19 +725,19 @@ pub fn stats_command_ranges(
         for block in blocks {
             if let Some(mut block_stats) =
                 block.calc_stats(Some(start), Some(end), Some(&species_indices))
-            {
-                block_stats.chrom = chrom.to_string();
-                stats_writer.write_stats(&block_stats, &species_dict, block)?;
-            }
+                {
+                    block_stats.chrom = chrom.to_string();
+                    stats_writer.write_stats(&block_stats, &species_dict, block)?;
+                }
         }
 
         progress.inc(1);
     }
 
     progress.finish_with_message(format!(
-        "Processing complete. Found {} total blocks",
-        total_blocks
-    ));
+            "Processing complete. Found {} total blocks",
+            total_blocks
+            ));
     info!("Total elapsed {:?}", total_time.elapsed());
     Ok(())
 }
@@ -745,7 +749,7 @@ fn convert_maf_block_to_binary(
     species_dict: &mut SpeciesDictionary,
     min_length: u64,
     compression_stats: &mut Option<&mut CompressionStats>,
-) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error>> {
     if block.sequences[0].size < min_length {
         return Ok(());
     }
@@ -761,15 +765,15 @@ fn convert_maf_block_to_binary(
         let species_idx = species_dict.get_or_insert(species);
 
         sequences.push((
-            AlignedSequence {
-                species_idx,
-                start: seq.start as u32,
-                size: seq.size as u32,
-                strand: matches!(seq.strand, Strand::Reverse),
-                src_size: seq.src_size as u32,
-            },
-            seq.text.clone(),
-        ));
+                AlignedSequence {
+                    species_idx,
+                    start: seq.start as u32,
+                    size: seq.size as u32,
+                    strand: matches!(seq.strand, Strand::Reverse),
+                    src_size: seq.src_size as u32,
+                },
+                seq.text.clone(),
+                ));
     }
 
     let score = block.score.unwrap_or(0.0) as f32;
@@ -822,7 +826,7 @@ impl CompressionStats {
         info!(
             "Compression Statistics (sample size: {}):",
             self.sample_size
-        );
+            );
         info!("  Average ratio: {:.2}%", avg * 100.0);
         info!("  Min ratio: {:.2}%", min * 100.0);
         info!("  Max ratio: {:.2}%", max * 100.0);
@@ -843,7 +847,7 @@ fn process_maf_file(
     min_length: u64,
     progress: Option<&ProgressBar>,
     compression_stats: &mut Option<&mut CompressionStats>,
-) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error>> {
     let mut maf = MafReader::from_file(input)?;
     let _header = maf.read_header()?;
 
@@ -863,7 +867,7 @@ pub fn convert_to_binary(
     input: &Path,
     output_dir: &Path,
     min_length: u64,
-) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error>> {
     let total_time = Instant::now();
 
     let mut store = init_store(output_dir)?;
@@ -879,7 +883,7 @@ pub fn convert_to_binary(
         min_length,
         None,
         &mut Some(&mut compression_stats),
-    )?;
+        )?;
     store.finalize_with_metadata(&species_dict)?;
 
     compression_stats.report();
@@ -893,7 +897,7 @@ pub fn convert_to_binary_glob(
     input_pattern: &str,
     output_dir: &Path,
     min_length: u64,
-) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error>> {
     let total_time = Instant::now();
 
     // Collect and sort input files
@@ -911,11 +915,11 @@ pub fn convert_to_binary_glob(
     let progress = ProgressBar::new(input_files.len() as u64);
     progress.set_style(
         ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({msg})",
+        .template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({msg})",
             )?
-            .progress_chars("=>-"),
-    );
+        .progress_chars("=>-"),
+        );
 
     // Initialize store
     let mut store = init_store(output_dir)?;
@@ -940,7 +944,7 @@ pub fn convert_to_binary_glob(
             min_length,
             Some(&progress),
             &mut Some(&mut compression_stats),
-        )?;
+            )?;
     }
 
     // Finalize and cleanup
