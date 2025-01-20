@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 use std::{collections::HashSet, path::Path};
@@ -668,11 +668,18 @@ pub fn stats_command_ranges(
         .progress_chars("=>-"));
 
     // Setup input/output
+    // Use InputStream to handle compressed in put.
+    let input_stream = InputStream::new(&ranges_file);
+    let stream = input_stream.reader()?;
+
+    // Box the BufReader directly as a Read trait object
+    let boxed_reader: Box<dyn Read> = Box::new(stream);
+
     let mut reader = ReaderBuilder::new()
         .comment(Some(b'#'))
         .delimiter(b'\t')
         .has_headers(false)
-        .from_reader(File::open(ranges_file)?);
+        .from_reader(boxed_reader);
 
     let output_file = OutputStream::new(output);
     let mut stats_writer = AlignmentStatistics::new(output_file, species.clone(), include_rates)?;
