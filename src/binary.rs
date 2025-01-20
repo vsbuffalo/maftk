@@ -664,7 +664,10 @@ pub fn estimate_total_records(
     let records_per_byte = valid_lines as f64 / compressed_pos as f64;
     let estimated = (records_per_byte * total_size as f64) as u64;
 
-    Ok(estimated)
+    let buffer = 1.05;
+    let estimated = estimated as f64 * buffer;
+
+    Ok(estimated as u64)
 }
 
 pub fn stats_command_range(
