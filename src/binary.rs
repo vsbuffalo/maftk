@@ -10,7 +10,6 @@ use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
-use std::fs::File;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -559,55 +558,18 @@ pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary,
     }
 }
 
-pub fn build_tsv_reader(
-    filepath: impl Into<PathBuf>,
-    comment_char: Option<u8>,
-    flexible: bool,
-    has_headers: bool,
-) -> Result<csv::Reader<Box<dyn std::io::Read>>, Box<dyn std::error::Error>> {
-    let filepath = filepath.into();
-    let input_stream = InputStream::new(&filepath);
-
-    let stream = input_stream.reader()?;
-
-    // Box the BufReader directly as a Read trait object
-    let boxed_reader: Box<dyn Read> = Box::new(stream);
-
-    let csv_reader = ReaderBuilder::new()
-        .delimiter(b'\t')
-        .has_headers(has_headers)
-        .comment(comment_char)
-        .flexible(flexible)
-        .from_reader(boxed_reader);
-
-    Ok(csv_reader)
-}
-
 pub fn estimate_total_records(
     path: &std::path::Path,
     comment_char: Option<u8>,
-    delimiter: u8,
-    has_headers: bool,
-    flexible: bool,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let input_stream = InputStream::new(path);
-    let file = File::open(path)?;
-
-    // For small files, just count exact records
-    if file.metadata()?.len() < 1024 * 1024 {
-        // 1MB threshold
-        let mut csv_reader = build_tsv_reader(path, comment_char, flexible, has_headers)?;
-        return Ok(csv_reader.byte_records().count() as u64);
-    }
-
-    // For larger files, sample decompressed content
     let mut reader = input_stream.buffered_reader()?;
     let mut valid_lines = 0;
-    let mut total_bytes = 0;
+    let mut sample_bytes = 0;
     let mut line_buffer = Vec::new();
-    let sample_size = 1000; // Increased sample size for better estimation
+    let sample_size = 1000;
 
-    // Sample more lines for better estimation
+    // Sample 1000 valid lines to get average bytes per line
     while valid_lines < sample_size {
         line_buffer.clear();
         let bytes_read = reader.read_until(b'\n', &mut line_buffer)?;
@@ -622,13 +584,7 @@ pub fn estimate_total_records(
             }
         }
 
-        // Verify minimum fields
-        let field_count = line_buffer.iter().filter(|&&b| b == delimiter).count() + 1;
-        if !flexible && field_count < 3 {
-            continue;
-        }
-
-        total_bytes += bytes_read;
+        sample_bytes += bytes_read;
         valid_lines += 1;
     }
 
@@ -636,27 +592,27 @@ pub fn estimate_total_records(
         return Ok(0);
     }
 
-    // Calculate average bytes per valid line
-    let avg_bytes_per_line = total_bytes as f64 / valid_lines as f64;
+    // Calculate ratio between sampled lines and sampled bytes
+    let avg_bytes_per_line = sample_bytes as f64 / valid_lines as f64;
 
-    // Reset reader and count total decompressed bytes
-    let mut total_decompressed_size = 0;
+    // Get remaining bytes to read after sampling
+    let mut remaining_bytes = 0;
     let mut count_buffer = [0u8; 8192];
-    let mut reader = input_stream.buffered_reader()?;
-
     while let Ok(n) = reader.read(&mut count_buffer) {
         if n == 0 {
             break;
         }
-        total_decompressed_size += n;
+        remaining_bytes += n;
     }
 
-    // Estimate based on decompressed size
-    let estimated_records = (total_decompressed_size as f64 / avg_bytes_per_line) as u64;
+    // Total bytes = sample + remaining
+    let total_bytes = sample_bytes + remaining_bytes;
 
-    // Add a buffer
-    let buffer = 1.05;
-    Ok((estimated_records as f64 * buffer) as u64)
+    // Estimate based on the ratio from our sample
+    let estimated_records = (total_bytes as f64 / avg_bytes_per_line) as u64;
+
+    // Add 5% buffer for variance
+    Ok((estimated_records as f64 * 1.05) as u64)
 }
 
 pub fn stats_command_range(
@@ -722,7 +678,9 @@ pub fn stats_command_ranges(
     let total_time = Instant::now();
 
     // Setup progress bar
-    let estimated_records = estimate_total_records(ranges_file, Some(b'#'), b'\t', false, true)?;
+    let estimated_records = estimate_total_records(ranges_file, Some(b'#'))?;
+    info!("Estimated number of total ranges: {}", estimated_records);
+    // let estimated_records = 500_000;
     let progress = ProgressBar::new(estimated_records as u64).with_style(
         ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue}⟩ {pos}/{len} ({percent}%) [{eta_precise}] ({per_sec})")?
@@ -747,10 +705,12 @@ pub fn stats_command_ranges(
     let mut stats_writer = AlignmentStatistics::new(output_file, species.clone(), include_rates)?;
 
     // Open store and get species dictionary
+    let start_time = Instant::now();
     let mut store = GenomicDataStore::<MafBlock>::open(data_dir, None)?;
     let species_dict = store
         .metadata::<SpeciesDictionary>()
         .expect("Invaild metadata.");
+    info!("Index and metadata loaded {:?}", start_time.elapsed());
 
     // Convert species names to indices
     let species_indices: HashSet<u32> = species
@@ -767,17 +727,23 @@ pub fn stats_command_ranges(
             // I forgot to put # on.
             continue;
         }
+
         let record = result?;
         let chrom = record.get(0).ok_or("Missing chromosome")?;
         let start = record
             .get(1)
             .ok_or("Missing start coordinate")
-            .map_err(|e| format!("Invalid start coordinate (erorr kind: {}).", e))?
+            .map_err(|e| format!("Invalid start coordinate (erorr kind: {}). Maybe you meant to use --has-header?", e))?
             .parse()?;
         let end: u32 = record
             .get(2)
             .ok_or("Missing end coordinate")
-            .map_err(|e| format!("Invalid end coordinate (erorr kind: {}).", e))?
+            .map_err(|e| {
+                format!(
+                    "Invalid end coordinate (erorr kind: {}). Maybe you meant to use --has-header?",
+                    e
+                )
+            })?
             .parse()?;
 
         // Get overlapping blocks
