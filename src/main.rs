@@ -436,7 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     species,
                     &data_dir,
                     include_rates,
-                    has_header
+                    has_header,
                 )?;
             } else {
                 panic!("Invalid options");

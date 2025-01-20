@@ -559,44 +559,104 @@ pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary,
     }
 }
 
-/// Estimates number of records in a TSV/CSV file
-fn estimate_record_count(path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
+pub fn build_tsv_reader(
+    filepath: impl Into<PathBuf>,
+    comment_char: Option<u8>,
+    flexible: bool,
+    has_headers: bool,
+) -> Result<csv::Reader<Box<dyn std::io::Read>>, Box<dyn std::error::Error>> {
+    let filepath = filepath.into();
+    let input_stream = InputStream::new(&filepath);
+
+    let stream = input_stream.reader()?;
+
+    // Box the BufReader directly as a Read trait object
+    let boxed_reader: Box<dyn Read> = Box::new(stream);
+
+    let csv_reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(has_headers)
+        .comment(comment_char)
+        .flexible(flexible)
+        .from_reader(boxed_reader);
+
+    Ok(csv_reader)
+}
+
+pub fn estimate_total_records(
+    path: &std::path::Path,
+    comment_char: Option<u8>,
+    delimiter: u8,
+    has_headers: bool,
+    flexible: bool,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let input_stream = InputStream::new(path);
     let file = File::open(path)?;
-    let file_size = file.metadata()?.len();
 
-    // Sample first few lines to get average line length
-    let input_file = InputStream::new(path);
-    let mut reader = input_file.reader()?;
-    let mut buffer = String::new();
+    // For small files, just count exact records
+    if file.metadata()?.len() < 1024 * 1024 {
+        // 1MB threshold
+        let mut csv_reader = build_tsv_reader(path, comment_char, flexible, has_headers)?;
+        return Ok(csv_reader.byte_records().count() as u64);
+    }
+
+    // For larger files, sample decompressed content
+    let mut reader = input_stream.buffered_reader()?;
+    let mut valid_lines = 0;
     let mut total_bytes = 0;
-    let mut line_count = 0;
-    const SAMPLE_LINES: usize = 100;
+    let mut line_buffer = Vec::new();
+    let sample_size = 1000; // Increased sample size for better estimation
 
-    while line_count < SAMPLE_LINES {
-        buffer.clear();
-        let bytes_read = reader.read_line(&mut buffer)?;
+    // Sample more lines for better estimation
+    while valid_lines < sample_size {
+        line_buffer.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line_buffer)?;
         if bytes_read == 0 {
-            break;
-        } // EOF
+            break; // EOF
+        }
 
-        // Skip comments
-        if buffer.starts_with('#') {
+        // Skip comment lines
+        if let Some(comment) = comment_char {
+            if !line_buffer.is_empty() && line_buffer[0] == comment {
+                continue;
+            }
+        }
+
+        // Verify minimum fields
+        let field_count = line_buffer.iter().filter(|&&b| b == delimiter).count() + 1;
+        if !flexible && field_count < 3 {
             continue;
         }
 
         total_bytes += bytes_read;
-        line_count += 1;
+        valid_lines += 1;
     }
 
-    if line_count == 0 {
+    if valid_lines == 0 {
         return Ok(0);
     }
 
-    // Calculate average bytes per record
-    let avg_bytes_per_record = total_bytes as f64 / line_count as f64;
-    let estimated_records = (file_size as f64 / avg_bytes_per_record).ceil() as u64;
+    // Calculate average bytes per valid line
+    let avg_bytes_per_line = total_bytes as f64 / valid_lines as f64;
 
-    Ok(estimated_records)
+    // Reset reader and count total decompressed bytes
+    let mut total_decompressed_size = 0;
+    let mut count_buffer = [0u8; 8192];
+    let mut reader = input_stream.buffered_reader()?;
+
+    while let Ok(n) = reader.read(&mut count_buffer) {
+        if n == 0 {
+            break;
+        }
+        total_decompressed_size += n;
+    }
+
+    // Estimate based on decompressed size
+    let estimated_records = (total_decompressed_size as f64 / avg_bytes_per_line) as u64;
+
+    // Add a buffer
+    let buffer = 1.05;
+    Ok((estimated_records as f64 * buffer) as u64)
 }
 
 pub fn stats_command_range(
@@ -662,11 +722,12 @@ pub fn stats_command_ranges(
     let total_time = Instant::now();
 
     // Setup progress bar
-    let estimated_records = estimate_record_count(ranges_file)?;
-    let progress = ProgressBar::new(estimated_records);
-    progress.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ranges ({eta})")?
-        .progress_chars("=>-"));
+    let estimated_records = estimate_total_records(ranges_file, Some(b'#'), b'\t', false, true)?;
+    let progress = ProgressBar::new(estimated_records as u64).with_style(
+        ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue}⟩ {pos}/{len} ({percent}%) [{eta_precise}] ({per_sec})")?
+        .progress_chars("=> ")
+        );
 
     // Setup input/output
     // Use InputStream to handle compressed in put.
@@ -702,20 +763,22 @@ pub fn stats_command_ranges(
     // Process each range from the file
     for (i, result) in reader.records().enumerate() {
         if i == 0 && has_header {
-            // skip header -- back compatibility with data that 
+            // skip header -- back compatibility with data that
             // I forgot to put # on.
             continue;
         }
         let record = result?;
         let chrom = record.get(0).ok_or("Missing chromosome")?;
-        let start = record.get(1).ok_or("Missing start coordinate")
+        let start = record
+            .get(1)
+            .ok_or("Missing start coordinate")
             .map_err(|e| format!("Invalid start coordinate (erorr kind: {}).", e))?
             .parse()?;
-        let end: u32 = record.get(2).ok_or("Missing end coordinate")
+        let end: u32 = record
+            .get(2)
+            .ok_or("Missing end coordinate")
             .map_err(|e| format!("Invalid end coordinate (erorr kind: {}).", e))?
             .parse()?;
-
-
 
         // Get overlapping blocks
         let blocks: &[MafBlock] = store.get_overlapping(chrom, start, end)?;
@@ -725,19 +788,19 @@ pub fn stats_command_ranges(
         for block in blocks {
             if let Some(mut block_stats) =
                 block.calc_stats(Some(start), Some(end), Some(&species_indices))
-                {
-                    block_stats.chrom = chrom.to_string();
-                    stats_writer.write_stats(&block_stats, &species_dict, block)?;
-                }
+            {
+                block_stats.chrom = chrom.to_string();
+                stats_writer.write_stats(&block_stats, &species_dict, block)?;
+            }
         }
 
         progress.inc(1);
     }
 
     progress.finish_with_message(format!(
-            "Processing complete. Found {} total blocks",
-            total_blocks
-            ));
+        "Processing complete. Found {} total blocks",
+        total_blocks
+    ));
     info!("Total elapsed {:?}", total_time.elapsed());
     Ok(())
 }
@@ -749,7 +812,7 @@ fn convert_maf_block_to_binary(
     species_dict: &mut SpeciesDictionary,
     min_length: u64,
     compression_stats: &mut Option<&mut CompressionStats>,
-    ) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     if block.sequences[0].size < min_length {
         return Ok(());
     }
@@ -765,15 +828,15 @@ fn convert_maf_block_to_binary(
         let species_idx = species_dict.get_or_insert(species);
 
         sequences.push((
-                AlignedSequence {
-                    species_idx,
-                    start: seq.start as u32,
-                    size: seq.size as u32,
-                    strand: matches!(seq.strand, Strand::Reverse),
-                    src_size: seq.src_size as u32,
-                },
-                seq.text.clone(),
-                ));
+            AlignedSequence {
+                species_idx,
+                start: seq.start as u32,
+                size: seq.size as u32,
+                strand: matches!(seq.strand, Strand::Reverse),
+                src_size: seq.src_size as u32,
+            },
+            seq.text.clone(),
+        ));
     }
 
     let score = block.score.unwrap_or(0.0) as f32;
@@ -826,7 +889,7 @@ impl CompressionStats {
         info!(
             "Compression Statistics (sample size: {}):",
             self.sample_size
-            );
+        );
         info!("  Average ratio: {:.2}%", avg * 100.0);
         info!("  Min ratio: {:.2}%", min * 100.0);
         info!("  Max ratio: {:.2}%", max * 100.0);
@@ -847,7 +910,7 @@ fn process_maf_file(
     min_length: u64,
     progress: Option<&ProgressBar>,
     compression_stats: &mut Option<&mut CompressionStats>,
-    ) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let mut maf = MafReader::from_file(input)?;
     let _header = maf.read_header()?;
 
@@ -867,7 +930,7 @@ pub fn convert_to_binary(
     input: &Path,
     output_dir: &Path,
     min_length: u64,
-    ) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let total_time = Instant::now();
 
     let mut store = init_store(output_dir)?;
@@ -883,7 +946,7 @@ pub fn convert_to_binary(
         min_length,
         None,
         &mut Some(&mut compression_stats),
-        )?;
+    )?;
     store.finalize_with_metadata(&species_dict)?;
 
     compression_stats.report();
@@ -897,7 +960,7 @@ pub fn convert_to_binary_glob(
     input_pattern: &str,
     output_dir: &Path,
     min_length: u64,
-    ) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let total_time = Instant::now();
 
     // Collect and sort input files
@@ -915,11 +978,11 @@ pub fn convert_to_binary_glob(
     let progress = ProgressBar::new(input_files.len() as u64);
     progress.set_style(
         ProgressStyle::default_bar()
-        .template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({msg})",
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({msg})",
             )?
-        .progress_chars("=>-"),
-        );
+            .progress_chars("=>-"),
+    );
 
     // Initialize store
     let mut store = init_store(output_dir)?;
@@ -944,7 +1007,7 @@ pub fn convert_to_binary_glob(
             min_length,
             Some(&progress),
             &mut Some(&mut compression_stats),
-            )?;
+        )?;
     }
 
     // Finalize and cleanup
