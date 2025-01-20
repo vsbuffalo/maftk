@@ -17,6 +17,7 @@ indicatif = "0.17.9"
 lazy_static = "1.5.0"
 lru = "0.12.5"
 polars = { version = "0.45.1", features = ["lazy"] }
+rayon = "1.10.0"
 serde = { version = "1.0.216", features = ["derive"] }
 thiserror = "2.0.3"
 tracing = "0.1.41"

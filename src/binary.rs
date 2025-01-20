@@ -16,7 +16,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::{collections::HashSet, path::Path};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use hgindex::{GenomicDataStore, Record, RecordSlice};
 
@@ -75,7 +75,8 @@ impl CompressedText {
     }
 
     pub fn decompress(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let mut decoder = DeflateDecoder::new(Vec::new());
+        // Use a pre-allocated buffer sized for typical alignments
+        let mut decoder = DeflateDecoder::new(Vec::with_capacity(1024 * 16));
         decoder.write_all(&self.0)?;
         let bytes = decoder.finish()?;
         String::from_utf8(bytes).map_err(|e| e.into())
@@ -621,58 +622,45 @@ pub fn estimate_total_records(
     path: &std::path::Path,
     comment_char: Option<u8>,
 ) -> Result<u64, Box<dyn std::error::Error>> {
+    // Get total compressed size upfront
+    let total_size = std::fs::metadata(path)?.len();
+    
     let input_stream = InputStream::new(path);
     let mut reader = input_stream.buffered_reader()?;
+    let mut compressed_pos = 0;
     let mut valid_lines = 0;
-    let mut sample_bytes = 0;
     let mut line_buffer = Vec::new();
-    let sample_size = 1000;
+    let sample_size = 10_000;
 
-    // Sample 1000 valid lines to get average bytes per line
+    // Sample first 10k valid lines
     while valid_lines < sample_size {
         line_buffer.clear();
         let bytes_read = reader.read_until(b'\n', &mut line_buffer)?;
         if bytes_read == 0 {
-            break; // EOF
+            // Hit EOF - return actual count
+            return Ok(valid_lines);
         }
+        
+        // Track position in decompressed stream
+        compressed_pos += bytes_read;
 
-        // Skip comment lines
+        // Skip comment lines but count their bytes
         if let Some(comment) = comment_char {
             if !line_buffer.is_empty() && line_buffer[0] == comment {
                 continue;
             }
         }
-
-        sample_bytes += bytes_read;
         valid_lines += 1;
     }
 
-    if valid_lines == 0 {
-        return Ok(0);
-    }
+    // At this point we have:
+    // - Read compressed_pos bytes to get valid_lines
+    // - Total file size is total_size
+    // Use ratio to estimate total records
+    let records_per_byte = valid_lines as f64 / compressed_pos as f64;
+    let estimated = (records_per_byte * total_size as f64) as u64;
 
-    // Calculate ratio between sampled lines and sampled bytes
-    let avg_bytes_per_line = sample_bytes as f64 / valid_lines as f64;
-
-    // Get remaining bytes to read after sampling
-    let mut remaining_bytes = 0;
-    let mut count_buffer = [0u8; 8192];
-    while let Ok(n) = reader.read(&mut count_buffer) {
-        if n == 0 {
-            break;
-        }
-        remaining_bytes += n;
-    }
-
-    // Total bytes = sample + remaining
-    let total_bytes = sample_bytes + remaining_bytes;
-
-    // Estimate based on the ratio from our sample
-    let estimated_records = (total_bytes as f64 / avg_bytes_per_line) as u64;
-
-    // Tweak buffer if necessary
-    let buffer = 1.0;
-    Ok((estimated_records as f64 * buffer) as u64)
+    Ok(estimated)
 }
 
 pub fn stats_command_range(
@@ -738,6 +726,7 @@ pub fn stats_command_ranges(
     let total_time = Instant::now();
 
     // Setup progress bar
+    info!("Starting estimation of total records...");
     let estimated_records = estimate_total_records(ranges_file, Some(b'#'))?;
     info!("Estimated number of total ranges: {}", estimated_records);
     // let estimated_records = 500_000;
@@ -778,8 +767,8 @@ pub fn stats_command_ranges(
         .filter_map(|name| species_dict.species_to_index.get(name).copied())
         .collect();
 
-    // Add cache with reasonable size (e.g. 100 blocks)
-    let mut block_cache = BlockCache::new(100);
+    // Add cache with reasonable size (e.g. 1000 blocks)
+    let mut block_cache = BlockCache::new(1000);
     let mut block_chrom: Option<String> = None;
 
     let mut total_blocks = 0;

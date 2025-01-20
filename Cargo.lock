@@ -995,6 +995,7 @@ dependencies = [
  "lazy_static",
  "lru",
  "polars",
+ "rayon",
  "serde",
  "tempfile",
  "thiserror",
