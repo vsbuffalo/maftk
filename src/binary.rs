@@ -16,7 +16,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::{collections::HashSet, path::Path};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use hgindex::{GenomicDataStore, Record, RecordSlice};
 
@@ -388,27 +388,56 @@ impl MafBlock {
 pub struct BlockCache {
     // Cache key could be (chrom, block_start, block_end)
     cache: LruCache<(u32, u32), Vec<String>>,
+    hits: usize,
+    misses: usize,
+    total_time_saved: std::time::Duration,
 }
 
 impl BlockCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+            hits: 0,
+            misses: 0,
+            total_time_saved: std::time::Duration::new(0, 0),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.cache.len()
     }
 
     pub fn get_or_insert(&mut self, block: &MafBlock) -> Result<&Vec<String>, Box<dyn Error>> {
         let key = (block.start(), block.end());
 
-        if !self.cache.contains(&key) {
+        if self.cache.contains(&key) {
+            self.hits += 1;
+            Ok(self.cache.get(&key).unwrap())
+        } else {
+            self.misses += 1;
+            let start = Instant::now();
             let sequences = block.get_sequences()?;
+            let decompress_time = start.elapsed();
+            self.total_time_saved += decompress_time; // Track time we'll save on future hits
             self.cache.put(key.clone(), sequences);
+            Ok(self.cache.get(&key).unwrap())
         }
+    }
 
-        Ok(self.cache.get(&key).unwrap())
+    pub fn print_stats(&self) {
+        eprintln!("Cache Statistics:");
+        eprintln!("  Current size: {}/{}", self.cache.len(), self.cache.cap());
+        eprintln!("  Hits: {}", self.hits);
+        eprintln!("  Misses: {}", self.misses);
+        eprintln!(
+            "  Hit rate: {:.1}%",
+            (self.hits as f64 / (self.hits + self.misses) as f64) * 100.0
+        );
+        eprintln!("  Time saved on hits: {:?}", self.total_time_saved);
     }
 
     pub fn clear(&mut self) {
+        // debug!("clearing cache, {} elements.", self.cache.len());
         self.cache.clear();
     }
 }
@@ -749,8 +778,8 @@ pub fn stats_command_ranges(
         .filter_map(|name| species_dict.species_to_index.get(name).copied())
         .collect();
 
-    // Add cache with reasonable size (e.g. 1000 blocks)
-    let mut block_cache = BlockCache::new(1000);
+    // Add cache with reasonable size (e.g. 100 blocks)
+    let mut block_cache = BlockCache::new(100);
     let mut block_chrom: Option<String> = None;
 
     let mut total_blocks = 0;
@@ -769,6 +798,7 @@ pub fn stats_command_ranges(
             // check if we can clear buffer
             if cached_chrom != chrom {
                 // we need to clear buffer and update chrom.
+                // dbg!("new chrom = {}, old chrom = {}", cached_chrom, chrom);
                 block_chrom = Some(chrom.to_string());
                 block_cache.clear();
             }
@@ -776,6 +806,9 @@ pub fn stats_command_ranges(
             // no chrom set, first entry
             block_chrom = Some(chrom.to_string());
         };
+
+        // block_cache.print_stats();
+
         let start = record
             .get(1)
             .ok_or("Missing start coordinate")

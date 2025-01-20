@@ -3,7 +3,7 @@ use csv::{Writer, WriterBuilder};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::binary::{BlockCache, MafBlock, SpeciesDictionary};
 use crate::io::OutputStream;
@@ -292,9 +292,11 @@ pub fn calc_alignment_block_statistics(
     // but look on cache in case these decompressed sequences for this
     // block is in LRU cache already.
     let sequences = if let Some(cache) = &mut block_cache {
-        cache
+        let seqs = cache
             .get_or_insert(block)
-            .expect("error with MafBlock.get_sequences() in BlockCache.")
+            .expect("error with MafBlock.get_sequences() in BlockCache.");
+        debug!("Caching {} uncompressed sequences...", seqs.len());
+        seqs
     } else {
         &block
             .get_sequences()
