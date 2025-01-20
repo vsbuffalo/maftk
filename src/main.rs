@@ -372,7 +372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(species_dict.get_species(idx).unwrap())
                     };
 
-                    if let Some(stats) = block.calc_stats(Some(start), Some(end), None) {
+                    if let Some(stats) = block.calc_stats(Some(start), Some(end), None, None) {
                         let mut df = calc_block_statistics(&stats, &species_dict, focal_species)?;
                         if let Some(dir) = output_dir.as_ref() {
                             create_dir_all(dir)?;

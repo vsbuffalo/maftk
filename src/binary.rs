@@ -6,11 +6,13 @@ use flate2::write::{DeflateDecoder, DeflateEncoder};
 use flate2::Compression;
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
+use lru::LruCache;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::{collections::HashSet, path::Path};
@@ -241,8 +243,9 @@ impl MafBlock {
         start: Option<u32>,
         end: Option<u32>,
         species_indices: Option<&HashSet<u32>>,
+        block_cache: Option<&mut BlockCache>,
     ) -> Option<RegionStats> {
-        calc_alignment_block_statistics(self, species_indices, start, end)
+        calc_alignment_block_statistics(self, species_indices, start, end, block_cache)
     }
 
     pub fn pretty_print_alignments(&self, species_dict: &SpeciesDictionary, color: bool) {
@@ -382,6 +385,34 @@ impl MafBlock {
     }
 }
 
+pub struct BlockCache {
+    // Cache key could be (chrom, block_start, block_end)
+    cache: LruCache<(u32, u32), Vec<String>>,
+}
+
+impl BlockCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+        }
+    }
+
+    pub fn get_or_insert(&mut self, block: &MafBlock) -> Result<&Vec<String>, Box<dyn Error>> {
+        let key = (block.start(), block.end());
+
+        if !self.cache.contains(&key) {
+            let sequences = block.get_sequences()?;
+            self.cache.put(key.clone(), sequences);
+        }
+
+        Ok(self.cache.get(&key).unwrap())
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+}
+
 pub fn query_alignments(
     data_dir: &Path,
     chrom: &str,
@@ -422,10 +453,9 @@ pub fn query_alignments(
                 let length = (overlap_end - overlap_start) as usize;
 
                 // Get the sequences
-                let sequences = match block.get_sequences() {
-                    Ok(seqs) => seqs,
-                    Err(_) => return None,
-                };
+                let sequences = block
+                    .get_sequences()
+                    .expect("error with MafBlock.get_sequences()");
 
                 // Trim each sequence to just the overlapping region
                 let mut trimmed_sequences = Vec::new();
@@ -611,8 +641,9 @@ pub fn estimate_total_records(
     // Estimate based on the ratio from our sample
     let estimated_records = (total_bytes as f64 / avg_bytes_per_line) as u64;
 
-    // Add 5% buffer for variance
-    Ok((estimated_records as f64 * 1.05) as u64)
+    // Tweak buffer if necessary
+    let buffer = 1.0;
+    Ok((estimated_records as f64 * buffer) as u64)
 }
 
 pub fn stats_command_range(
@@ -642,7 +673,7 @@ pub fn stats_command_range(
         .filter_map(|name| species_dict.species_to_index.get(name).copied())
         .collect();
 
-    // Get overlapping blocks for the single range
+    // Get all overlapping blocks for the single range
     let blocks: &[MafBlock] = store.get_overlapping(seqname, start, end)?;
 
     info!(
@@ -656,7 +687,7 @@ pub fn stats_command_range(
     // Process each block
     for block in blocks {
         if let Some(mut block_stats) =
-            block.calc_stats(Some(start), Some(end), Some(&species_indices))
+            block.calc_stats(Some(start), Some(end), Some(&species_indices), None)
         {
             block_stats.chrom = seqname.to_string();
             stats_writer.write_stats(&block_stats, &species_dict, block)?;
@@ -718,6 +749,10 @@ pub fn stats_command_ranges(
         .filter_map(|name| species_dict.species_to_index.get(name).copied())
         .collect();
 
+    // Add cache with reasonable size (e.g. 1000 blocks)
+    let mut block_cache = BlockCache::new(1000);
+    let mut block_chrom: Option<String> = None;
+
     let mut total_blocks = 0;
 
     // Process each range from the file
@@ -730,6 +765,17 @@ pub fn stats_command_ranges(
 
         let record = result?;
         let chrom = record.get(0).ok_or("Missing chromosome")?;
+        if let Some(ref mut cached_chrom) = block_chrom {
+            // check if we can clear buffer
+            if cached_chrom != chrom {
+                // we need to clear buffer and update chrom.
+                block_chrom = Some(chrom.to_string());
+                block_cache.clear();
+            }
+        } else {
+            // no chrom set, first entry
+            block_chrom = Some(chrom.to_string());
+        };
         let start = record
             .get(1)
             .ok_or("Missing start coordinate")
@@ -752,9 +798,12 @@ pub fn stats_command_ranges(
 
         // Process each block
         for block in blocks {
-            if let Some(mut block_stats) =
-                block.calc_stats(Some(start), Some(end), Some(&species_indices))
-            {
+            if let Some(mut block_stats) = block.calc_stats(
+                Some(start),
+                Some(end),
+                Some(&species_indices),
+                Some(&mut block_cache),
+            ) {
                 block_stats.chrom = chrom.to_string();
                 stats_writer.write_stats(&block_stats, &species_dict, block)?;
             }

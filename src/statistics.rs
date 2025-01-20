@@ -5,7 +5,7 @@ use std::io::Write;
 use thiserror::Error;
 use tracing::info;
 
-use crate::binary::{MafBlock, SpeciesDictionary};
+use crate::binary::{BlockCache, MafBlock, SpeciesDictionary};
 use crate::io::OutputStream;
 
 #[derive(Error, Debug)]
@@ -250,6 +250,7 @@ pub fn calc_alignment_block_statistics(
     species_indices: Option<&HashSet<u32>>,
     region_start: Option<u32>,
     region_end: Option<u32>,
+    mut block_cache: Option<&mut BlockCache>,
 ) -> Option<RegionStats> {
     let ref_seq = &block.sequence_metadata[0];
     let block_start = ref_seq.start;
@@ -288,9 +289,16 @@ pub fn calc_alignment_block_statistics(
     };
 
     // Get all sequences at once to avoid multiple decompressions
-    let sequences = match block.get_sequences() {
-        Ok(seqs) => seqs,
-        Err(_) => return None,
+    // but look on cache in case these decompressed sequences for this
+    // block is in LRU cache already.
+    let sequences = if let Some(cache) = &mut block_cache {
+        cache
+            .get_or_insert(block)
+            .expect("error with MafBlock.get_sequences() in BlockCache.")
+    } else {
+        &block
+            .get_sequences()
+            .expect("error with MafBlock.get_sequences() (no cache)")
     };
 
     for i in 0..block.sequence_metadata.len() {
@@ -401,7 +409,8 @@ mod tests {
         let block = create_test_block("ATCG", "ATCG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -417,7 +426,8 @@ mod tests {
         let block = create_test_block("ATCG", "TAGC");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 4);
@@ -433,7 +443,8 @@ mod tests {
         let block = create_test_block("A-TCG", "AATCG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -450,7 +461,8 @@ mod tests {
         let block = create_test_block("A-TC-G", "A-TC-G");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -467,7 +479,8 @@ mod tests {
         let block = create_test_block("AtCg", "aTcG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0); // Should handle case-insensitive comparison
@@ -483,7 +496,8 @@ mod tests {
         let block = create_test_block("A-TCG", "AT-CG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -499,7 +513,8 @@ mod tests {
         let block = create_test_block("A.TCG", "AATCG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -515,7 +530,8 @@ mod tests {
         let block = create_test_block("", "");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
@@ -566,7 +582,7 @@ mod tests {
         let block = create_test_block("A.TcG", "AtC-g");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats = block
-            .calc_stats(None, None, Some(&species_indices))
+            .calc_stats(None, None, Some(&species_indices), None)
             .unwrap();
         dbg!(&stats);
 
@@ -582,10 +598,11 @@ mod tests {
     fn test_gap_rate_calculation() {
         #[rustfmt::skip]
         let block = create_test_block("A--TC--G", 
-                                      "AT-TC-GG");
+            "AT-TC-GG");
         let species_indices: HashSet<u32> = vec![0, 1].into_iter().collect();
         let stats =
-            calc_alignment_block_statistics(&block, Some(&species_indices), None, None).unwrap();
+            calc_alignment_block_statistics(&block, Some(&species_indices), None, None, None)
+                .unwrap();
 
         let pair_stats = stats.pairwise_stats.get(&(0, 1)).unwrap();
         assert_eq!(pair_stats.substitutions, 0);
