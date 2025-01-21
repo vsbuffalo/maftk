@@ -622,6 +622,9 @@ pub fn print_alignments(blocks: Vec<MafBlock>, species_dict: &SpeciesDictionary,
     }
 }
 
+
+// NOTE this seems to still have a bug -- it is
+// a bit of an underestimate
 pub fn estimate_total_records(
     path: &std::path::Path,
     comment_char: Option<u8>,
@@ -634,7 +637,7 @@ pub fn estimate_total_records(
     let mut compressed_pos = 0;
     let mut valid_lines = 0;
     let mut line_buffer = Vec::new();
-    let sample_size = 10_000;
+    let sample_size = 100_000;
 
     // Sample first 10k valid lines
     while valid_lines < sample_size {
@@ -648,7 +651,7 @@ pub fn estimate_total_records(
         // Track position in decompressed stream
         compressed_pos += bytes_read;
 
-        // Skip comment lines but count their bytes
+        // Skip comment lines
         if let Some(comment) = comment_char {
             if !line_buffer.is_empty() && line_buffer[0] == comment {
                 continue;
@@ -664,7 +667,8 @@ pub fn estimate_total_records(
     let records_per_byte = valid_lines as f64 / compressed_pos as f64;
     let estimated = (records_per_byte * total_size as f64) as u64;
 
-    let buffer = 1.05;
+    let buffer = 2.7; // Major fudge factor to fix bad estimate
+                      // TODO
     let estimated = estimated as f64 * buffer;
 
     Ok(estimated as u64)
@@ -836,7 +840,7 @@ pub fn stats_command_ranges(
         let blocks: &[MafBlock] = store.get_overlapping(chrom, start, end)?;
         total_blocks += blocks.len();
 
-        // Process each block
+        // Process each block: (1) calc statistics (2) write.
         for block in blocks {
             if let Some(mut block_stats) = block.calc_stats(
                 Some(start),

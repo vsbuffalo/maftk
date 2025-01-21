@@ -316,6 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize logger with default level INFO
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .without_time()
         .with_max_level(level)
         .init();
